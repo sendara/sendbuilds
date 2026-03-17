@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::{Parser, Subcommand};
 use getrandom::getrandom;
 use serde_json::Value;
@@ -1154,8 +1154,12 @@ fn parse_time_machine_to_system_time(input: &str) -> Result<SystemTime> {
         let local = dt_fixed.with_timezone(&Local);
         return Ok(system_time_from_local(local)?);
     }
-    if let Ok(dt_local) = Local.datetime_from_str(input, "%Y-%m-%d %H:%M:%S") {
-        return Ok(system_time_from_local(dt_local)?);
+    if let Ok(dt_local) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
+        let local = Local
+            .from_local_datetime(&dt_local)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve local datetime `{}`", input))?;
+        return Ok(system_time_from_local(local)?);
     }
     if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
         let local = Local
@@ -1512,6 +1516,8 @@ fn deploy_artifact_root_for_source(
             name,
             language: None,
         },
+        workspace: None,
+        packages: None,
         source: git_repo.map(|repo| SourceConfig {
             repo: repo.to_string(),
             branch: git_branch.map(|b| b.to_string()),
@@ -1951,6 +1957,8 @@ fn run_quick_build_with_options(
             name: name.clone(),
             language: None,
         },
+        workspace: None,
+        packages: None,
         source: git_repo.map(|repo| SourceConfig {
             repo,
             branch: git_branch,

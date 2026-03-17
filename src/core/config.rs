@@ -6,7 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BuildConfig {
     pub project: ProjectConfig,
     pub workspace: Option<WorkspaceConfig>,
@@ -30,7 +30,7 @@ pub struct OutputConfig {
     pub events: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ProjectConfig {
     pub name: String,
     pub language: Option<String>,
@@ -60,14 +60,14 @@ pub struct PackageConfig {
     pub container_image: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SourceConfig {
     pub repo: String,
     pub branch: Option<String>,
     pub commit: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BuildStepConfig {
     pub install_cmd: Option<String>,
     pub build_cmd: Option<String>,
@@ -75,7 +75,7 @@ pub struct BuildStepConfig {
     pub output_dir: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DeployConfig {
     pub artifact_dir: String,
     pub targets: Option<Vec<String>>,
