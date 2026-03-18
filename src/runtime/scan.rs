@@ -137,17 +137,9 @@ fn run_java_scan(
         );
     }
     if let Some(wrapper) = gradle_wrapper_cmd(work_dir) {
-        let cmd = format!(
-            "{wrapper} dependencyCheckAnalyze --console=plain -Dorg.gradle.daemon=false"
-        );
-        return run_optional_scan(
-            &cmd,
-            wrapper,
-            &["--version"],
-            work_dir,
-            env,
-            sandbox,
-        );
+        let cmd =
+            format!("{wrapper} dependencyCheckAnalyze --console=plain -Dorg.gradle.daemon=false");
+        return run_optional_scan(&cmd, wrapper, &["--version"], work_dir, env, sandbox);
     }
     if work_dir.join("build.gradle").exists() || work_dir.join("build.gradle.kts").exists() {
         return run_optional_scan(

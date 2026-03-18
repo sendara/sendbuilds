@@ -606,10 +606,7 @@ fn dotnet_projects_from_sln(root: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for line in raw.lines() {
         if let Some(idx) = line.find(".csproj") {
-            let start = line[..idx]
-                .rfind('"')
-                .map(|v| v + 1)
-                .unwrap_or(0);
+            let start = line[..idx].rfind('"').map(|v| v + 1).unwrap_or(0);
             let value = line[start..idx + 7].trim_matches('"');
             if !value.is_empty() {
                 out.push(value.replace('\\', "/"));
@@ -622,7 +619,9 @@ fn dotnet_projects_from_sln(root: &Path) -> Result<Vec<String>> {
 fn read_package_name(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let json: Value = serde_json::from_str(&raw).ok()?;
-    json.get("name").and_then(Value::as_str).map(ToString::to_string)
+    json.get("name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn add_node_internal_deps(mut pkgs: Vec<Package>) -> Result<Vec<Package>> {
@@ -653,11 +652,7 @@ fn add_node_internal_deps(mut pkgs: Vec<Package>) -> Result<Vec<Package>> {
 fn add_rust_internal_deps(mut pkgs: Vec<Package>) -> Result<Vec<Package>> {
     let mut path_map: HashMap<String, String> = HashMap::new();
     for pkg in &pkgs {
-        let rel = pkg
-            .path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_string();
+        let rel = pkg.path.to_string_lossy().replace('\\', "/").to_string();
         path_map.insert(rel, pkg.name.clone());
     }
     for pkg in &mut pkgs {
@@ -701,7 +696,10 @@ fn expand_workspace_patterns(root: &Path, patterns: &[String]) -> Result<Vec<Pat
     let mut matches = BTreeSet::new();
     for pattern in patterns {
         let norm = pattern.replace('\\', "/");
-        let parts = norm.split('/').filter(|p| !p.is_empty()).collect::<Vec<_>>();
+        let parts = norm
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>();
         walk_match(root, root, &parts, &mut matches)?;
     }
     Ok(matches.into_iter().collect())

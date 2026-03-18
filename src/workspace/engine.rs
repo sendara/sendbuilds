@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::core::config::{default_artifact_dir, default_cache_dir, PackageConfig, WorkspaceConfig};
+use crate::core::config::{
+    default_artifact_dir, default_cache_dir, PackageConfig, WorkspaceConfig,
+};
 use crate::core::{BuildConfig, BuildStepConfig, ProjectConfig};
 use crate::engine::BuildEngine;
 use crate::utils::cache::compute_file_signatures;
@@ -43,13 +45,7 @@ pub fn run_workspace_build(cfg: BuildConfig, opts: &WorkspaceRunOptions) -> Resu
     let graph = build_graph(&packages);
     let build_mode = resolve_build_mode(&workspace_cfg, opts);
     let cache_root = workspace_cache_root(&cfg, &workspace)?;
-    let affected = compute_affected_packages(
-        &root,
-        &packages,
-        &graph,
-        &cache_root,
-        &build_mode,
-    )?;
+    let affected = compute_affected_packages(&root, &packages, &graph, &cache_root, &build_mode)?;
 
     let mut selected = order_packages(&packages, &graph, &affected);
     if selected.is_empty() {
@@ -140,11 +136,19 @@ fn should_run_workspace(
         if cfg.mode.as_deref() == Some("explicit") {
             return true;
         }
-        if cfg.packages.as_ref().map(|p| !p.is_empty()).unwrap_or(false) {
+        if cfg
+            .packages
+            .as_ref()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false)
+        {
             return true;
         }
     }
-    packages_cfg.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
+    packages_cfg
+        .as_ref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false)
 }
 
 fn resolve_root(workspace_cfg: &Option<WorkspaceConfig>) -> Result<PathBuf> {
@@ -245,7 +249,10 @@ fn apply_package_filter(
     packages.retain(|p| allow.contains(&p.name));
 }
 
-fn resolve_build_mode(workspace_cfg: &Option<WorkspaceConfig>, opts: &WorkspaceRunOptions) -> String {
+fn resolve_build_mode(
+    workspace_cfg: &Option<WorkspaceConfig>,
+    opts: &WorkspaceRunOptions,
+) -> String {
     if let Some(mode) = opts.build_mode.as_ref() {
         return mode.clone();
     }
@@ -345,8 +352,10 @@ fn order_packages(
     graph: &DependencyGraph,
     affected: &HashSet<String>,
 ) -> Vec<Package> {
-    let mut map: HashMap<String, Package> =
-        packages.iter().map(|p| (p.name.clone(), p.clone())).collect();
+    let mut map: HashMap<String, Package> = packages
+        .iter()
+        .map(|p| (p.name.clone(), p.clone()))
+        .collect();
     let mut out = Vec::new();
     for name in &graph.topo_order {
         if affected.contains(name) {
@@ -371,7 +380,10 @@ fn build_config_for_package(
     let mut cfg = BuildConfig {
         project: ProjectConfig {
             name: pkg.name.clone(),
-            language: pkg.language.clone().or_else(|| base.project.language.clone()),
+            language: pkg
+                .language
+                .clone()
+                .or_else(|| base.project.language.clone()),
         },
         workspace: base.workspace.clone(),
         packages: base.packages.clone(),
@@ -428,7 +440,13 @@ fn build_config_for_package(
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(default_cache_dir);
-        cache.dir = Some(base_cache.join(workspace_key).join(&pkg.name).display().to_string());
+        cache.dir = Some(
+            base_cache
+                .join(workspace_key)
+                .join(&pkg.name)
+                .display()
+                .to_string(),
+        );
     }
     Ok(cfg)
 }
