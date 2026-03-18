@@ -12,6 +12,45 @@ Build automation CLI with step events, caching, auto-detection, metrics, sandbox
 sendbuilds build --config sendbuild.toml
 ```
 
+Unused dependency detection (best-effort, per language):
+
+```bash
+sendbuilds build --unused-deps
+```
+
+## Workspace / Monorepo
+
+sendbuilds can detect and build workspaces (Node, Rust, Go, Gradle/Maven, .NET, Python).
+Workspace mode is opt-in via config or CLI flags; single-project behavior is unchanged.
+
+CLI examples:
+
+```bash
+sendbuilds build --workspace --affected
+sendbuilds build --workspace --packages api,web
+sendbuilds deploy --local --workspace --all
+```
+
+Config example:
+
+```toml
+[workspace]
+enabled = true
+root = "."
+mode = "auto" # or "explicit"
+packages = ["service-a", "service-b"]
+build = "affected"
+
+[[package]]
+name = "service-a"
+path = "packages/service-a"
+language = "nodejs"
+build_cmd = "pnpm run build"
+output_dir = "dist"
+targets = ["directory", "container_image"]
+container_image = "service-a:latest"
+```
+
 ## Install
 
 ```bash

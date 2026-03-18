@@ -989,6 +989,17 @@ fn infer_container_start(src: &Path) -> Result<(Vec<String>, Option<u16>)> {
     );
 }
 
+pub fn infer_local_start_command(src: &Path) -> Result<Vec<String>> {
+    let (mut cmd, _port) = infer_container_start(src)?;
+    if cmd.is_empty() {
+        anyhow::bail!("cannot infer local start command (empty)");
+    }
+    if needs_node_prefix(&cmd) {
+        cmd.insert(0, "node".to_string());
+    }
+    Ok(cmd)
+}
+
 fn find_first_jar(src: &Path) -> Option<String> {
     let candidates = [
         src.join("target"),
@@ -1009,6 +1020,23 @@ fn find_first_jar(src: &Path) -> Option<String> {
         }
     }
     None
+}
+
+fn needs_node_prefix(cmd: &[String]) -> bool {
+    if cmd.is_empty() {
+        return false;
+    }
+    let first = cmd[0].trim().to_lowercase();
+    if matches!(
+        first.as_str(),
+        "node" | "npm" | "pnpm" | "yarn" | "deno" | "bun"
+    ) {
+        return false;
+    }
+    first.ends_with(".js")
+        || first.ends_with(".mjs")
+        || first.ends_with(".cjs")
+        || first.ends_with(".ts")
 }
 
 fn find_first_jar_recursive(root: &Path) -> Option<PathBuf> {

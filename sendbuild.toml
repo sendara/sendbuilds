@@ -2,6 +2,26 @@
 name     = "test"
 # language = "nodejs" # optional override (auto-detected if omitted)
 
+# [workspace]
+# enabled = true
+# root = "."
+# mode = "auto" # or "explicit"
+# packages = ["service-a", "service-b"] # optional allow-list
+# build = "affected" # or "all" | "list"
+# graph_output = "./artifacts/workspace-graph.json"
+#
+# [[package]]
+# name = "service-a"
+# path = "packages/service-a"
+# language = "nodejs"
+# install_cmd = "pnpm install --frozen-lockfile"
+# build_cmd = "pnpm run build"
+# output_dir = "dist"
+# start_cmd = "pnpm run start"
+# depends_on = ["shared-lib"]
+# targets = ["directory", "container_image"]
+# container_image = "service-a:latest"
+
 # [source] is optional. if omitted, build uses current folder files.
 # [source]
 # repo = "https://github.com/you/my-app.git"

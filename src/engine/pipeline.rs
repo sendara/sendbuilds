@@ -25,6 +25,7 @@ pub struct BuildEngine {
     in_place: bool,
     events_override: Option<bool>,
     reproducible: bool,
+    unused_deps: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +59,7 @@ impl BuildEngine {
             in_place: false,
             events_override: None,
             reproducible: false,
+            unused_deps: false,
         }
     }
 
@@ -78,6 +80,11 @@ impl BuildEngine {
 
     pub fn with_reproducible(mut self, reproducible: bool) -> Self {
         self.reproducible = reproducible;
+        self
+    }
+
+    pub fn with_unused_deps(mut self, unused: bool) -> Self {
+        self.unused_deps = unused;
         self
     }
 
@@ -154,6 +161,7 @@ impl BuildEngine {
         let mut security_report: Option<security::SecurityReport> = None;
         let mut security_sbom: Option<Value> = None;
         let mut supply_chain_metadata: Option<Value> = None;
+        let unused_deps_enabled = self.unused_deps;
 
         let cache = self.configure_cache(&ctx)?;
         if let Some(c) = &cache {
@@ -279,6 +287,17 @@ impl BuildEngine {
             }
             Ok(())
         })?);
+        if unused_deps_enabled {
+            let lang = resolved_language.clone();
+            steps.push(self.execute_step(&ctx, "unused-deps", |_e, cctx, step| {
+                let out = crate::runtime::unused::run(&lang, &cctx.work_dir, &cctx.env, sandbox_enabled)?;
+                for line in crate::runtime::unused::to_build_logs(&out) {
+                    step.push_log(line.clone());
+                    log::pipe(&line);
+                }
+                Ok(())
+            })?);
+        }
         if security_enabled {
             let lang = resolved_language.clone();
             let security_cfg = cfg.security.clone();
@@ -642,6 +661,16 @@ impl BuildEngine {
         }
 
         steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
+            let root = publish_result
+                .as_ref()
+                .map(|p| p.root.clone())
+                .unwrap_or_else(|| ctx.artifact_dir.clone());
+            let build_id = root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let source_identity = detect_source_identity(cfg, &ctx.work_dir);
             let metrics_steps = steps
                 .iter()
                 .map(|s| StepMetric {
@@ -655,16 +684,16 @@ impl BuildEngine {
                 .collect::<Vec<_>>();
             let report = serde_json::json!({
                 "project": cfg.project.name,
+                "build_id": build_id,
                 "finished_at": chrono::Local::now().to_rfc3339(),
+                "source": source_identity,
                 "cache": cache_metrics,
+                "source_fingerprint": if source_fingerprint.is_empty() { None } else { Some(source_fingerprint.clone()) },
+                "dependency_fingerprint": if dependency_fingerprint.is_empty() { None } else { Some(dependency_fingerprint.clone()) },
                 "security": &security_report,
                 "supply_chain_metadata": &supply_chain_metadata,
                 "steps": metrics_steps
             });
-            let root = publish_result
-                .as_ref()
-                .map(|p| p.root.clone())
-                .unwrap_or_else(|| ctx.artifact_dir.clone());
             fs::create_dir_all(&root)?;
             if let Some(sbom) = &security_sbom {
                 let sbom_out = root.join("sbom.json");
@@ -684,6 +713,19 @@ impl BuildEngine {
             let out = root.join("build-metrics.json");
             fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
             step.push_log(format!("metrics {}", out.display()));
+
+            let build_info = serde_json::json!({
+                "schema_version": "1",
+                "project": cfg.project.name,
+                "build_id": report.get("build_id").cloned().unwrap_or(serde_json::Value::Null),
+                "finished_at": report.get("finished_at").cloned().unwrap_or(serde_json::Value::Null),
+                "source": report.get("source").cloned().unwrap_or(serde_json::Value::Null),
+                "source_fingerprint": report.get("source_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
+                "dependency_fingerprint": report.get("dependency_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
+            });
+            let build_info_out = root.join("build-info.json");
+            fs::write(&build_info_out, serde_json::to_vec_pretty(&build_info)?)?;
+            step.push_log(format!("build info {}", build_info_out.display()));
             Ok(())
         })?);
 
@@ -1369,6 +1411,58 @@ impl BuildEngine {
             ));
         }
         Ok(published)
+    }
+}
+
+fn detect_source_identity(cfg: &BuildConfig, work_dir: &Path) -> Value {
+    let configured_repo = cfg.source.as_ref().map(|s| s.repo.clone());
+    let configured_branch = cfg.source.as_ref().and_then(|s| s.branch.clone());
+    let configured_commit = cfg.source.as_ref().and_then(|s| s.commit.clone());
+
+    let cwd = std::env::current_dir().ok();
+    let git_repo = git_output(work_dir, &["remote", "get-url", "origin"]).or_else(|| {
+        cwd.as_ref()
+            .and_then(|p| git_output(p, &["remote", "get-url", "origin"]))
+    });
+    let git_branch = git_output(work_dir, &["rev-parse", "--abbrev-ref", "HEAD"]).or_else(|| {
+        cwd.as_ref()
+            .and_then(|p| git_output(p, &["rev-parse", "--abbrev-ref", "HEAD"]))
+    });
+    let git_commit = git_output(work_dir, &["rev-parse", "HEAD"]).or_else(|| {
+        cwd.as_ref()
+            .and_then(|p| git_output(p, &["rev-parse", "HEAD"]))
+    });
+
+    let source_type = if cfg.source.is_some() {
+        "git"
+    } else if git_repo.is_some() {
+        "local-git"
+    } else {
+        "local"
+    };
+
+    serde_json::json!({
+        "type": source_type,
+        "repo": configured_repo.or(git_repo),
+        "branch": configured_branch.or(git_branch),
+        "commit": configured_commit.or(git_commit),
+    })
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
     }
 }
 

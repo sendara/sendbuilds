@@ -52,14 +52,35 @@ pub fn run(
             env,
             sandbox,
         ),
-        "java" => shell::run(
-            "echo security scan skipped: configure scanner for java",
+        "java" => run_java_scan(work_dir, env, sandbox),
+        "php" => run_optional_scan(
+            "composer audit --format=json",
+            "composer",
+            &["--version"],
             work_dir,
             env,
             sandbox,
         ),
-        "php" => shell::run(
-            "echo security scan skipped: configure scanner for php",
+        "dotnet" => run_optional_scan(
+            "dotnet list package --vulnerable --include-transitive --format json",
+            "dotnet",
+            &["--version"],
+            work_dir,
+            env,
+            sandbox,
+        ),
+        "deno" => run_optional_scan(
+            "deno audit --json",
+            "deno",
+            &["--version"],
+            work_dir,
+            env,
+            sandbox,
+        ),
+        "elixir" => run_optional_scan(
+            "mix hex.audit",
+            "mix",
+            &["--version"],
             work_dir,
             env,
             sandbox,
@@ -98,6 +119,62 @@ fn command_available(bin: &str, args: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn run_java_scan(
+    work_dir: &Path,
+    env: &HashMap<String, String>,
+    sandbox: bool,
+) -> Result<ShellRunOutput> {
+    if work_dir.join("pom.xml").exists() {
+        return run_optional_scan(
+            "mvn -q -DskipTests org.owasp:dependency-check-maven:check -Dformat=JSON -DfailOnError=false",
+            "mvn",
+            &["-v"],
+            work_dir,
+            env,
+            sandbox,
+        );
+    }
+    if let Some(wrapper) = gradle_wrapper_cmd(work_dir) {
+        let cmd = format!(
+            "{wrapper} dependencyCheckAnalyze --console=plain -Dorg.gradle.daemon=false"
+        );
+        return run_optional_scan(
+            &cmd,
+            wrapper,
+            &["--version"],
+            work_dir,
+            env,
+            sandbox,
+        );
+    }
+    if work_dir.join("build.gradle").exists() || work_dir.join("build.gradle.kts").exists() {
+        return run_optional_scan(
+            "gradle dependencyCheckAnalyze --console=plain -Dorg.gradle.daemon=false",
+            "gradle",
+            &["--version"],
+            work_dir,
+            env,
+            sandbox,
+        );
+    }
+    shell::run(
+        "echo security scan skipped: configure scanner for java",
+        work_dir,
+        env,
+        sandbox,
+    )
+}
+
+fn gradle_wrapper_cmd(work_dir: &Path) -> Option<&'static str> {
+    if cfg!(windows) && work_dir.join("gradlew.bat").exists() {
+        return Some("gradlew.bat");
+    }
+    if work_dir.join("gradlew").exists() {
+        return Some("./gradlew");
+    }
+    None
 }
 
 pub fn enabled(config: Option<&ScanConfig>) -> bool {
@@ -246,6 +323,9 @@ fn normalize_language(language: &str) -> String {
         "java" | "jvm" => "java".to_string(),
         "php" => "php".to_string(),
         "rust" | "rs" => "rust".to_string(),
+        "dotnet" | ".net" | "net" | "csharp" | "c#" => "dotnet".to_string(),
+        "deno" => "deno".to_string(),
+        "elixir" | "ex" | "exs" => "elixir".to_string(),
         other => other.to_string(),
     }
 }

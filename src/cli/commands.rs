@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::{Parser, Subcommand};
 use getrandom::getrandom;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ use crate::core::config::{
 };
 use crate::core::BuildConfig;
 use crate::engine::BuildEngine;
+use crate::runtime::artifacts;
+use crate::workspace::engine::{run_workspace_build, run_workspace_deploy, WorkspaceRunOptions};
 
 #[derive(Parser)]
 #[command(name = "sendbuilds", about = "send it. build it.")]
@@ -35,6 +38,16 @@ enum Cmd {
         reproducible: bool,
         #[arg(long)]
         in_place: bool,
+        #[arg(long)]
+        unused_deps: bool,
+        #[arg(long)]
+        workspace: bool,
+        #[arg(long = "packages", value_delimiter = ',')]
+        packages: Vec<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        affected: bool,
         #[arg(long)]
         git: Option<String>,
         #[arg(long)]
@@ -58,6 +71,14 @@ enum Cmd {
         targets: Vec<String>,
         #[arg(long)]
         image: Option<String>,
+        #[arg(long)]
+        workspace: bool,
+        #[arg(long = "packages", value_delimiter = ',')]
+        packages: Vec<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        affected: bool,
         #[arg(long = "dry-run")]
         dry_run: bool,
         #[arg(long)]
@@ -83,6 +104,12 @@ enum Cmd {
         build_id: Option<String>,
         #[arg(long = "to")]
         to: Option<String>,
+        #[arg(short, long, default_value = "sendbuild.toml")]
+        config: String,
+    },
+    Diff {
+        build_a: String,
+        build_b: String,
         #[arg(short, long, default_value = "sendbuild.toml")]
         config: String,
     },
@@ -183,6 +210,11 @@ pub fn run() -> Result<()> {
             events,
             reproducible,
             in_place,
+            unused_deps,
+            workspace,
+            packages,
+            all,
+            affected,
             git,
             branch,
             docker,
@@ -193,11 +225,33 @@ pub fn run() -> Result<()> {
             }
             if BuildConfig::exists(&config) {
                 let cfg = BuildConfig::from_file(&config)?;
+                let mut build_mode = None;
+                if all {
+                    build_mode = Some("all".to_string());
+                } else if affected {
+                    build_mode = Some("affected".to_string());
+                }
+                let opts = WorkspaceRunOptions {
+                    force: workspace,
+                    packages: if packages.is_empty() {
+                        None
+                    } else {
+                        Some(packages)
+                    },
+                    build_mode,
+                    events,
+                    reproducible,
+                    unused_deps,
+                };
+                if run_workspace_build(cfg.clone(), &opts)? {
+                    return Ok(());
+                }
                 prepare_signing_key(cfg.signing.as_ref())?;
                 BuildEngine::from_config(cfg)
                     .with_in_place(in_place)
                     .with_events(events)
                     .with_reproducible(reproducible)
+                    .with_unused_deps(unused_deps)
                     .run()
             } else {
                 println!(
@@ -209,6 +263,7 @@ pub fn run() -> Result<()> {
                     .with_in_place(true)
                     .with_events(events)
                     .with_reproducible(reproducible)
+                    .with_unused_deps(unused_deps)
                     .run()
             }
         }
@@ -220,10 +275,26 @@ pub fn run() -> Result<()> {
             docker,
             targets,
             image,
+            workspace,
+            packages,
+            all,
+            affected,
             dry_run,
             remote,
         } => run_deploy(
-            repo, local, build, branch, docker, targets, image, dry_run, remote,
+            repo,
+            local,
+            build,
+            branch,
+            docker,
+            targets,
+            image,
+            workspace,
+            packages,
+            all,
+            affected,
+            dry_run,
+            remote,
         ),
         Cmd::Debug { build_id, config } => run_debug(&build_id, &config),
         Cmd::Replay {
@@ -237,6 +308,11 @@ pub fn run() -> Result<()> {
             to,
             config,
         } => run_rollback(build_id, to, &config),
+        Cmd::Diff {
+            build_a,
+            build_b,
+            config,
+        } => run_diff(&build_a, &build_b, &config),
         Cmd::Artifacts { cmd, config } => run_artifacts(cmd, &config),
         Cmd::Init { template, yes } => init_project(template.as_deref(), yes),
         Cmd::Cache { cmd, config } => run_cache(cmd, &config),
@@ -277,6 +353,10 @@ fn run_deploy(
     docker: bool,
     targets: Vec<String>,
     image: Option<String>,
+    workspace: bool,
+    packages: Vec<String>,
+    all: bool,
+    affected: bool,
     dry_run: bool,
     remote: bool,
 ) -> Result<()> {
@@ -285,6 +365,38 @@ fn run_deploy(
     }
     if branch.is_some() && (local || repo.is_none()) {
         bail!("--branch requires a git repo deploy target");
+    }
+
+    if workspace && repo.is_some() {
+        bail!("workspace deploy is only supported with --local for now");
+    }
+    if workspace && !local {
+        println!("Workspace deploy requested; forcing --local mode.");
+    }
+
+    if BuildConfig::exists("sendbuild.toml") {
+        let cfg = BuildConfig::from_file("sendbuild.toml")?;
+        let mut build_mode = None;
+        if all {
+            build_mode = Some("all".to_string());
+        } else if affected {
+            build_mode = Some("affected".to_string());
+        }
+        let opts = WorkspaceRunOptions {
+            force: workspace,
+            packages: if packages.is_empty() {
+                None
+            } else {
+                Some(packages.clone())
+            },
+            build_mode,
+            events: None,
+            reproducible: false,
+            unused_deps: false,
+        };
+        if run_workspace_deploy(cfg, &opts, force_build)? {
+            return Ok(());
+        }
     }
 
     let git_repo = if local { None } else { repo };
@@ -414,8 +526,8 @@ fn run_deploy(
         if start_local_artifact(&cwd)? {
             return Ok(());
         }
-        bail!(
-            "deploy start failed: no runnable local artifact/workspace command detected. run `sendbuilds deploy --build` to force rebuild"
+        println!(
+            "No reusable local build was started. Building fresh artifacts and deploying locally ..."
         );
     }
 
@@ -432,10 +544,19 @@ fn run_deploy(
         Some(false),
         Some(normalized_targets),
         false,
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "deploy build failed (repo={}, branch={}, container_mode={})",
+            git_repo.as_deref().unwrap_or("local-workspace"),
+            branch.as_deref().unwrap_or("default"),
+            should_use_container
+        )
+    })?;
 
     if should_use_container {
-        start_deployed_container(&image_tag, &project_name)?;
+        start_deployed_container(&image_tag, &project_name)
+            .with_context(|| format!("deploy runtime start failed for image `{image_tag}`"))?;
     } else {
         let artifact_root =
             deploy_artifact_root_for_source(git_repo.as_deref(), branch.as_deref())?;
@@ -541,6 +662,378 @@ fn run_rollback(build_id: Option<String>, to: Option<String>, config_path: &str)
     let selected = select_build_id(build_id, None, to, config_path)?;
     println!("Rolling back to build `{}`", selected);
     run_replay_selected(&selected, config_path)
+}
+
+fn run_diff(build_a: &str, build_b: &str, config_path: &str) -> Result<()> {
+    let artifact_base = resolve_artifact_base(config_path)?;
+    let left = load_build_bundle(&artifact_base, build_a)?;
+    let right = load_build_bundle(&artifact_base, build_b)?;
+
+    println!("Build Diff");
+    println!("----------");
+    println!(
+        "build_a   : {} ({})",
+        left.id,
+        normalize_display_path(&left.root)
+    );
+    println!(
+        "build_b   : {} ({})",
+        right.id,
+        normalize_display_path(&right.root)
+    );
+
+    let left_source = source_summary(&left.metrics);
+    let right_source = source_summary(&right.metrics);
+    println!("source_a  : {left_source}");
+    println!("source_b  : {right_source}");
+
+    let (dep_added, dep_removed, dep_changed) =
+        compare_dependency_components(&left.sbom, &right.sbom);
+    println!();
+    println!("Dependencies changed");
+    println!(
+        "- added={} removed={} version_changed={}",
+        dep_added.len(),
+        dep_removed.len(),
+        dep_changed.len()
+    );
+    if let Some(sample) = dep_added.first() {
+        println!("- sample added: {sample}");
+    }
+    if let Some(sample) = dep_removed.first() {
+        println!("- sample removed: {sample}");
+    }
+    if let Some(sample) = dep_changed.first() {
+        println!("- sample version change: {sample}");
+    }
+
+    println!();
+    println!("Base image changed");
+    let left_base = detect_base_image(&left);
+    let right_base = detect_base_image(&right);
+    println!(
+        "- build_a base: {}",
+        left_base.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "- build_b base: {}",
+        right_base.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "- changed={}",
+        if left_base == right_base { "no" } else { "yes" }
+    );
+
+    println!();
+    println!("Artifact size difference");
+    let left_size = payload_size_bytes(&left)?;
+    let right_size = payload_size_bytes(&right)?;
+    let delta = right_size as i128 - left_size as i128;
+    let pct = if left_size == 0 {
+        0.0
+    } else {
+        (delta as f64 / left_size as f64) * 100.0
+    };
+    println!("- build_a: {} bytes", left_size);
+    println!("- build_b: {} bytes", right_size);
+    println!("- delta  : {:+} bytes ({:+.2}%)", delta, pct);
+
+    println!();
+    println!("SBOM difference");
+    let left_components = sbom_component_count(&left.sbom);
+    let right_components = sbom_component_count(&right.sbom);
+    println!("- components build_a: {}", left_components);
+    println!("- components build_b: {}", right_components);
+    println!(
+        "- delta components: {:+}",
+        right_components as i64 - left_components as i64
+    );
+
+    println!();
+    println!("Security differences");
+    print_security_delta("source-scan", &left.security, &right.security);
+    let left_container = left
+        .security
+        .as_ref()
+        .and_then(|v| v.get("container_scan"))
+        .filter(|v| !v.is_null())
+        .cloned();
+    let right_container = right
+        .security
+        .as_ref()
+        .and_then(|v| v.get("container_scan"))
+        .filter(|v| !v.is_null())
+        .cloned();
+    print_security_delta("container-scan", &left_container, &right_container);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BuildBundle {
+    id: String,
+    root: PathBuf,
+    metrics: Value,
+    sbom: Value,
+    security: Option<Value>,
+    lifecycle: Option<Value>,
+    supply_chain: Option<Value>,
+    container_image: Option<String>,
+}
+
+fn load_build_bundle(artifact_base: &Path, build_id: &str) -> Result<BuildBundle> {
+    let root = resolve_build_root(artifact_base, build_id)?;
+    let metrics = read_required_json(&root.join("build-metrics.json"))?;
+    let sbom = read_optional_json(&root.join("sbom.json")).unwrap_or(Value::Null);
+    let security = read_optional_json(&root.join("security-report.json"))
+        .or_else(|| metrics.get("security").cloned().filter(|v| !v.is_null()));
+    let lifecycle = read_optional_json(&root.join("cnb").join("lifecycle-metadata.json"));
+    let supply_chain = read_optional_json(&root.join("supply-chain-metadata.json")).or_else(|| {
+        metrics
+            .get("supply_chain_metadata")
+            .cloned()
+            .filter(|v| !v.is_null())
+    });
+    let container_notes = glob_container_note_files(&root)?;
+    let container_image =
+        first_container_image_from_notes(&container_notes)?.map(|(image, _path)| image);
+
+    Ok(BuildBundle {
+        id: build_id.to_string(),
+        root,
+        metrics,
+        sbom,
+        security,
+        lifecycle,
+        supply_chain,
+        container_image,
+    })
+}
+
+fn read_required_json(path: &Path) -> Result<Value> {
+    let raw = fs::read_to_string(path).with_context(|| {
+        format!(
+            "missing or unreadable json file: {}",
+            normalize_display_path(path)
+        )
+    })?;
+    let parsed = serde_json::from_str::<Value>(&raw)
+        .with_context(|| format!("invalid json in {}", normalize_display_path(path)))?;
+    Ok(parsed)
+}
+
+fn read_optional_json(path: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
+fn source_summary(metrics: &Value) -> String {
+    let source = metrics.get("source").and_then(Value::as_object);
+    let repo = source
+        .and_then(|s| s.get("repo"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown-repo");
+    let branch = source
+        .and_then(|s| s.get("branch"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown-branch");
+    let commit = source
+        .and_then(|s| s.get("commit"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown-commit");
+    format!("{repo}@{branch}#{commit}")
+}
+
+fn compare_dependency_components(
+    left_sbom: &Value,
+    right_sbom: &Value,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let left = sbom_component_map(left_sbom);
+    let right = sbom_component_map(right_sbom);
+
+    let left_keys = left.keys().cloned().collect::<BTreeSet<_>>();
+    let right_keys = right.keys().cloned().collect::<BTreeSet<_>>();
+
+    let added = right_keys
+        .difference(&left_keys)
+        .map(|k| {
+            format!(
+                "{k}@{}",
+                right
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+        })
+        .collect::<Vec<_>>();
+    let removed = left_keys
+        .difference(&right_keys)
+        .map(|k| {
+            format!(
+                "{k}@{}",
+                left.get(k)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut changed = Vec::new();
+    for key in left_keys.intersection(&right_keys) {
+        let Some(a) = left.get(key) else {
+            continue;
+        };
+        let Some(b) = right.get(key) else {
+            continue;
+        };
+        if a != b {
+            changed.push(format!("{key}: {a} -> {b}"));
+        }
+    }
+    (added, removed, changed)
+}
+
+fn sbom_component_map(sbom: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(components) = sbom.get("components").and_then(Value::as_array) else {
+        return out;
+    };
+
+    for item in components {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let scope = item
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("library");
+        let key = format!("{kind}:{scope}:{name}");
+        let version = item
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        out.insert(key, version);
+    }
+    out
+}
+
+fn detect_base_image(bundle: &BuildBundle) -> Option<String> {
+    let from_security = bundle
+        .security
+        .as_ref()
+        .and_then(|v| v.get("distroless"))
+        .and_then(Value::as_object)
+        .and_then(|d| {
+            d.get("to_base")
+                .and_then(Value::as_str)
+                .or_else(|| d.get("to").and_then(Value::as_str))
+                .or_else(|| d.get("from_base").and_then(Value::as_str))
+                .or_else(|| d.get("from").and_then(Value::as_str))
+        })
+        .map(|s| s.to_string());
+    if from_security.is_some() {
+        return from_security;
+    }
+    let from_supply = bundle
+        .supply_chain
+        .as_ref()
+        .and_then(|v| v.get("distroless"))
+        .and_then(Value::as_object)
+        .and_then(|d| {
+            d.get("to")
+                .and_then(Value::as_str)
+                .or_else(|| d.get("from").and_then(Value::as_str))
+        })
+        .map(|s| s.to_string());
+    if from_supply.is_some() {
+        return from_supply;
+    }
+    bundle.container_image.clone()
+}
+
+fn payload_size_bytes(bundle: &BuildBundle) -> Result<u64> {
+    if let Some(lifecycle) = &bundle.lifecycle {
+        if let Some(paths) = lifecycle
+            .get("exported_artifacts")
+            .and_then(Value::as_array)
+        {
+            let mut total = 0u64;
+            for p in paths {
+                let Some(rel) = p.as_str() else {
+                    continue;
+                };
+                let abs = bundle.root.join(rel);
+                total = total.saturating_add(path_size_bytes(&abs)?);
+            }
+            if total > 0 {
+                return Ok(total);
+            }
+        }
+    }
+    path_size_bytes(&bundle.root)
+}
+
+fn path_size_bytes(path: &Path) -> Result<u64> {
+    let meta = fs::metadata(path)?;
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    if !meta.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(path_size_bytes(&entry.path())?);
+    }
+    Ok(total)
+}
+
+fn sbom_component_count(sbom: &Value) -> usize {
+    sbom.get("components")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+fn print_security_delta(label: &str, left: &Option<Value>, right: &Option<Value>) {
+    let left_scan = left.as_ref().and_then(Value::as_object);
+    let right_scan = right.as_ref().and_then(Value::as_object);
+    if left_scan.is_none() && right_scan.is_none() {
+        println!("- {label}: unavailable in both builds");
+        return;
+    }
+
+    let metrics = [
+        "total",
+        "critical",
+        "high",
+        "moderate",
+        "low",
+        "info",
+        "misconfigurations",
+        "secrets",
+    ];
+    let mut parts = Vec::new();
+    for key in metrics {
+        let a = left_scan
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let b = right_scan
+            .and_then(|m| m.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let d = b as i128 - a as i128;
+        parts.push(format!("{key}:{}->{}/({:+})", a, b, d));
+    }
+    println!("- {label}: {}", parts.join(", "));
 }
 
 fn run_replay_selected(build_id: &str, config_path: &str) -> Result<()> {
@@ -661,8 +1154,12 @@ fn parse_time_machine_to_system_time(input: &str) -> Result<SystemTime> {
         let local = dt_fixed.with_timezone(&Local);
         return Ok(system_time_from_local(local)?);
     }
-    if let Ok(dt_local) = Local.datetime_from_str(input, "%Y-%m-%d %H:%M:%S") {
-        return Ok(system_time_from_local(dt_local)?);
+    if let Ok(dt_local) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
+        let local = Local
+            .from_local_datetime(&dt_local)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve local datetime `{}`", input))?;
+        return Ok(system_time_from_local(local)?);
     }
     if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
         let local = Local
@@ -1019,6 +1516,8 @@ fn deploy_artifact_root_for_source(
             name,
             language: None,
         },
+        workspace: None,
+        packages: None,
         source: git_repo.map(|repo| SourceConfig {
             repo: repo.to_string(),
             branch: git_branch.map(|b| b.to_string()),
@@ -1192,6 +1691,23 @@ fn start_local_artifact(dir: &Path) -> Result<bool> {
             return Ok(true);
         }
     }
+    // Generic fallback: infer a runnable command for non-Node/Python stacks.
+    if let Ok(cmd) = artifacts::infer_local_start_command(dir) {
+        if let Some((bin, args)) = cmd.split_first() {
+            if !looks_like_path(bin) && !command_exists(bin) {
+                println!(
+                    "Skipping inferred start command `{}` (runtime not available).",
+                    bin
+                );
+                return Ok(false);
+            }
+            println!("Starting local artifact with `{}` ...", cmd.join(" "));
+            let status = Command::new(bin).args(args).current_dir(dir).status();
+            if status.as_ref().map(|s| s.success()).unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+    }
     Ok(false)
 }
 
@@ -1203,10 +1719,18 @@ fn command_exists(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn looks_like_path(bin: &str) -> bool {
+    bin.starts_with('.')
+        || bin.contains('\\')
+        || bin.contains('/')
+        || bin.contains(':')
+}
+
 fn start_deployed_container(image: &str, project_name: &str) -> Result<()> {
     if !command_exists("docker") {
         bail!("docker is required to start deployed container, but it was not found");
     }
+    ensure_docker_daemon_ready()?;
 
     let container_name = format!("{project_name}-deploy");
     let _ = Command::new("docker")
@@ -1214,6 +1738,15 @@ fn start_deployed_container(image: &str, project_name: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+
+    if !docker_image_exists(image)? {
+        bail!(
+            "image `{}` is not present locally. the container build may have been skipped or failed earlier. \
+run `sendbuilds build --docker --image {}` and retry deploy",
+            image,
+            image
+        );
+    }
 
     println!(
         "Starting deployed container `{}` from image `{}` ...",
@@ -1223,10 +1756,21 @@ fn start_deployed_container(image: &str, project_name: &str) -> Result<()> {
         .args(["run", "-d", "--name", &container_name, "-P", image])
         .output()?;
     if !run.status.success() {
+        let stderr = render_output_stream(&run.stderr);
+        let stdout = render_output_stream(&run.stdout);
+        let state =
+            docker_container_state(&container_name).unwrap_or_else(|| "unavailable".to_string());
+        let logs =
+            docker_container_logs(&container_name).unwrap_or_else(|| "unavailable".to_string());
         bail!(
-            "failed to start container `{}` from image `{}`",
+            "failed to start container `{}` from image `{}`. docker_run_exit={:?}; docker_run_stderr={}; docker_run_stdout={}; container_state={}; container_logs={}; hints: verify Dockerfile CMD/ENTRYPOINT, required env vars, and exposed ports",
             container_name,
-            image
+            image,
+            run.status.code(),
+            stderr,
+            stdout,
+            state,
+            logs
         );
     }
 
@@ -1252,6 +1796,86 @@ fn start_deployed_container(image: &str, project_name: &str) -> Result<()> {
         .unwrap_or_else(|| "unknown".to_string());
     println!("running={}", running);
     Ok(())
+}
+
+fn ensure_docker_daemon_ready() -> Result<()> {
+    let out = Command::new("docker").arg("info").output();
+    match out {
+        Ok(res) if res.status.success() => Ok(()),
+        Ok(res) => bail!(
+            "docker daemon is not ready (docker info exit={:?}). stderr={} stdout={}. \
+hints: start Docker Desktop (or dockerd) and retry",
+            res.status.code(),
+            render_output_stream(&res.stderr),
+            render_output_stream(&res.stdout)
+        ),
+        Err(err) => bail!("failed to run `docker info`: {}", err),
+    }
+}
+
+fn docker_image_exists(image: &str) -> Result<bool> {
+    let out = Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()?;
+    Ok(out.status.success())
+}
+
+fn docker_container_state(container_name: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{.State.Status}}|{{.State.Error}}|{{.State.ExitCode}}",
+            container_name,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn docker_container_logs(container_name: &str) -> Option<String> {
+    let out = Command::new("docker")
+        .args(["logs", "--tail", "80", container_name])
+        .output()
+        .ok()?;
+    let logs = if out.stdout.is_empty() && out.stderr.is_empty() {
+        String::new()
+    } else if out.stderr.is_empty() {
+        render_output_stream(&out.stdout)
+    } else if out.stdout.is_empty() {
+        render_output_stream(&out.stderr)
+    } else {
+        format!(
+            "{} | {}",
+            render_output_stream(&out.stdout),
+            render_output_stream(&out.stderr)
+        )
+    };
+    if logs.is_empty() {
+        None
+    } else {
+        Some(logs)
+    }
+}
+
+fn render_output_stream(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw).replace('\n', " | ");
+    let trimmed = text.trim().to_string();
+    if trimmed.len() > 600 {
+        let mut clipped = trimmed.chars().take(600).collect::<String>();
+        clipped.push_str(" ...");
+        clipped
+    } else {
+        trimmed
+    }
 }
 
 fn infer_deploy_container_need(git_repo: Option<&str>) -> Result<bool> {
@@ -1333,6 +1957,8 @@ fn run_quick_build_with_options(
             name: name.clone(),
             language: None,
         },
+        workspace: None,
+        packages: None,
         source: git_repo.map(|repo| SourceConfig {
             repo,
             branch: git_branch,

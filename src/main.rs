@@ -5,6 +5,7 @@ mod errors;
 mod languages;
 mod output;
 mod runtime;
+mod workspace;
 mod utils;
 mod workers;
 
