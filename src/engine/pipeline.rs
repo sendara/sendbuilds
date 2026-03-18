@@ -290,7 +290,8 @@ impl BuildEngine {
         if unused_deps_enabled {
             let lang = resolved_language.clone();
             steps.push(self.execute_step(&ctx, "unused-deps", |_e, cctx, step| {
-                let out = crate::runtime::unused::run(&lang, &cctx.work_dir, &cctx.env, sandbox_enabled)?;
+                let out =
+                    crate::runtime::unused::run(&lang, &cctx.work_dir, &cctx.env, sandbox_enabled)?;
                 for line in crate::runtime::unused::to_build_logs(&out) {
                     step.push_log(line.clone());
                     log::pipe(&line);

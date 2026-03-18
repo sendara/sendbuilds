@@ -63,7 +63,13 @@ pub fn to_build_logs(report: &UnusedDepsReport) -> Vec<String> {
     if !report.unused.is_empty() {
         out.push(format!(
             "unused-deps packages {}",
-            report.unused.iter().take(25).cloned().collect::<Vec<_>>().join(", ")
+            report
+                .unused
+                .iter()
+                .take(25)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     for note in &report.notes {
@@ -79,7 +85,10 @@ fn run_node_depcheck(
     sandbox: bool,
 ) -> Result<()> {
     if !command_available("depcheck", &["--version"]) {
-        report.notes.push("depcheck not available; install with npm i -g depcheck or add to devDependencies".to_string());
+        report.notes.push(
+            "depcheck not available; install with npm i -g depcheck or add to devDependencies"
+                .to_string(),
+        );
         return Ok(());
     }
     report.scanner = "depcheck".to_string();
@@ -203,9 +212,9 @@ fn run_composer_unused(
     sandbox: bool,
 ) -> Result<()> {
     if !command_available("composer-unused", &["--version"]) {
-        report
-            .notes
-            .push("composer-unused not available; install composer-unused/composer-unused".to_string());
+        report.notes.push(
+            "composer-unused not available; install composer-unused/composer-unused".to_string(),
+        );
         return Ok(());
     }
     report.scanner = "composer-unused".to_string();
@@ -241,7 +250,9 @@ fn run_dotnet_unused(
     sandbox: bool,
 ) -> Result<()> {
     if !command_available("dotnet-unused", &["--version"]) {
-        report.notes.push("dotnet-unused not available; install dotnet tool dotnet-unused".to_string());
+        report
+            .notes
+            .push("dotnet-unused not available; install dotnet tool dotnet-unused".to_string());
         return Ok(());
     }
     report.scanner = "dotnet-unused".to_string();

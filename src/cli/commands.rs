@@ -282,19 +282,8 @@ pub fn run() -> Result<()> {
             dry_run,
             remote,
         } => run_deploy(
-            repo,
-            local,
-            build,
-            branch,
-            docker,
-            targets,
-            image,
-            workspace,
-            packages,
-            all,
-            affected,
-            dry_run,
-            remote,
+            repo, local, build, branch, docker, targets, image, workspace, packages, all, affected,
+            dry_run, remote,
         ),
         Cmd::Debug { build_id, config } => run_debug(&build_id, &config),
         Cmd::Replay {
@@ -1720,10 +1709,7 @@ fn command_exists(bin: &str) -> bool {
 }
 
 fn looks_like_path(bin: &str) -> bool {
-    bin.starts_with('.')
-        || bin.contains('\\')
-        || bin.contains('/')
-        || bin.contains(':')
+    bin.starts_with('.') || bin.contains('\\') || bin.contains('/') || bin.contains(':')
 }
 
 fn start_deployed_container(image: &str, project_name: &str) -> Result<()> {
