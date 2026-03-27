@@ -1,9 +1,13 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Instant;
+use std::time::Duration;
 
 static SANDBOX_STRICT: AtomicBool = AtomicBool::new(false);
 
@@ -38,6 +42,19 @@ pub fn run_allow_failure(
     env: &HashMap<String, String>,
     sandbox: bool,
 ) -> Result<ShellRunOutput> {
+    run_allow_failure_with_line_handler(cmd, cwd, env, sandbox, |_| {})
+}
+
+pub fn run_allow_failure_with_line_handler<F>(
+    cmd: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    sandbox: bool,
+    mut on_line: F,
+) -> Result<ShellRunOutput>
+where
+    F: FnMut(&str),
+{
     if sandbox && is_blocked_command(cmd, SANDBOX_STRICT.load(Ordering::Relaxed)) {
         bail!("sandbox blocked command: {}", redact_command_for_log(cmd));
     }
@@ -47,6 +64,7 @@ pub fn run_allow_failure(
 
     let mut command = shell_cmd(cmd);
     command.current_dir(cwd);
+    command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
@@ -58,22 +76,52 @@ pub fn run_allow_failure(
         command.env(k, v);
     }
 
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn: {}", redact_command_for_log(cmd)))?;
-    let output = child.wait_with_output()?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        logs.push(format!("stdout: {line}"));
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture child stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture child stderr")?;
+    let (tx, rx) = mpsc::channel::<String>();
+    let stdout_reader = spawn_pipe_reader(stdout, "stdout", tx.clone());
+    let stderr_reader = spawn_pipe_reader(stderr, "stderr", tx);
+
+    let status = loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                logs.push(line.clone());
+                on_line(&line);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+            }
+        }
+
+        if let Some(status) = child.try_wait()? {
+            while let Ok(line) = rx.recv_timeout(Duration::from_millis(50)) {
+                logs.push(line.clone());
+                on_line(&line);
+            }
+            break status;
+        }
+    };
+
+    join_pipe_reader(stdout_reader)?;
+    join_pipe_reader(stderr_reader)?;
+    while let Ok(line) = rx.try_recv() {
+        logs.push(line.clone());
+        on_line(&line);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stderr.lines() {
-        logs.push(format!("stderr: {line}"));
-    }
-
-    let status = output.status;
     let secs = start.elapsed().as_secs_f32();
     let success = status.success();
     let exit_code = status.code();
@@ -84,6 +132,32 @@ pub fn run_allow_failure(
         success,
         exit_code,
     })
+}
+
+fn spawn_pipe_reader<R>(reader: R, stream_name: &'static str, tx: Sender<String>) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    let _ = tx.send(format!("{stream_name}: {line}"));
+                }
+                Err(err) => {
+                    let _ = tx.send(format!("{stream_name}: <read error: {err}>"));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<()>) -> Result<()> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("failed to join process output reader"))
 }
 
 pub fn set_sandbox_strict(enabled: bool) {

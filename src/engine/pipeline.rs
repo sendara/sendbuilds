@@ -938,11 +938,16 @@ impl BuildEngine {
         step: &mut Step,
     ) -> Result<shell::ShellRunOutput> {
         if self.reproducible {
-            let run = shell::run_allow_failure(cmd, wd, env, sandbox)?;
-            for line in &run.logs {
-                step.push_log(line.clone());
-                log::pipe(line);
-            }
+            let run = shell::run_allow_failure_with_line_handler(
+                cmd,
+                wd,
+                env,
+                sandbox,
+                |line| {
+                    step.push_log(line.to_string());
+                    log::pipe(line);
+                },
+            )?;
             if run.success {
                 return Ok(run);
             }
@@ -960,11 +965,16 @@ impl BuildEngine {
                 i + 1,
                 shell::redact_command_for_log(c)
             ));
-            let run = shell::run_allow_failure(c, wd, env, sandbox)?;
-            for line in &run.logs {
-                step.push_log(line.clone());
-                log::pipe(line);
-            }
+            let run = shell::run_allow_failure_with_line_handler(
+                c,
+                wd,
+                env,
+                sandbox,
+                |line| {
+                    step.push_log(line.to_string());
+                    log::pipe(line);
+                },
+            )?;
             if run.success {
                 return Ok(run);
             }
