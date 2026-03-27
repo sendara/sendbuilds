@@ -73,6 +73,7 @@ pub struct BuildStepConfig {
     pub build_cmd: Option<String>,
     pub parallel_build_cmds: Option<Vec<String>>,
     pub output_dir: Option<String>,
+    pub prefer_offline: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -909,12 +909,21 @@ impl BuildEngine {
             return raw.to_string();
         }
         let has = |name: &str| work_dir.join(name).exists();
+        let prefer_offline = self
+            .config
+            .build
+            .as_ref()
+            .and_then(|b| b.prefer_offline)
+            .unwrap_or(false);
         if raw.starts_with("pnpm install") {
             let mut cmd = raw.to_string();
             if has("pnpm-lock.yaml") && !cmd.contains("--frozen-lockfile") {
                 cmd.push_str(" --frozen-lockfile");
             }
-            if !cmd.contains("--prefer-offline") {
+            if has("node_modules") && !cmd.contains("--force") {
+                cmd.push_str(" --force");
+            }
+            if prefer_offline && !cmd.contains("--prefer-offline") {
                 cmd.push_str(" --prefer-offline");
             }
             return cmd;
@@ -924,7 +933,11 @@ impl BuildEngine {
             return format!("{raw} --frozen-lockfile");
         }
         if raw == "npm install" && has("package-lock.json") {
-            return "npm ci --prefer-offline".to_string();
+            return if prefer_offline {
+                "npm ci --prefer-offline".to_string()
+            } else {
+                "npm ci".to_string()
+            };
         }
         raw.to_string()
     }
@@ -999,9 +1012,10 @@ impl BuildEngine {
     fn install_fallback_candidates(&self, initial: &str) -> Vec<String> {
         let mut out = vec![initial.to_string()];
         if initial.starts_with("pnpm install") {
-            let no_offline = remove_flag(initial, "--prefer-offline");
-            push_unique(&mut out, no_offline.clone());
-            push_unique(&mut out, remove_flag(&no_offline, "--frozen-lockfile"));
+            let no_force = remove_flag(initial, "--force");
+            push_unique(&mut out, remove_flag(initial, "--prefer-offline"));
+            push_unique(&mut out, remove_flag(&no_force, "--prefer-offline"));
+            push_unique(&mut out, remove_flag(&no_force, "--frozen-lockfile"));
         } else if initial.starts_with("yarn install") {
             push_unique(&mut out, remove_flag(initial, "--frozen-lockfile"));
         } else if initial.starts_with("npm ci") {
@@ -1079,16 +1093,16 @@ impl BuildEngine {
 
     fn infer_install_cmd(&self, wd: &Path) -> Result<String> {
         if wd.join("pnpm-lock.yaml").exists() {
-            return Ok("pnpm install --frozen-lockfile --prefer-offline".to_string());
+            return Ok("pnpm install --frozen-lockfile".to_string());
         }
         if wd.join("yarn.lock").exists() {
             return Ok("yarn install --frozen-lockfile".to_string());
         }
         if wd.join("package-lock.json").exists() {
-            return Ok("npm ci --prefer-offline".to_string());
+            return Ok("npm ci".to_string());
         }
         if wd.join("package.json").exists() {
-            return Ok("npm install --prefer-offline".to_string());
+            return Ok("npm install".to_string());
         }
         if wd.join("Gemfile").exists() {
             return Ok("bundle install".to_string());

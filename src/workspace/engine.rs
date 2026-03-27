@@ -411,6 +411,7 @@ fn build_config_for_package(
             build_cmd: None,
             parallel_build_cmds: None,
             output_dir: None,
+            prefer_offline: None,
         });
         if pkg.install_cmd.is_some() {
             build.install_cmd = pkg.install_cmd.clone();
