@@ -56,6 +56,10 @@ enum Cmd {
         docker: bool,
         #[arg(long)]
         image: Option<String>,
+        #[arg(long = "push-image")]
+        push_image: Option<String>,
+        #[arg(long = "verify-image")]
+        verify_image: Option<String>,
         #[arg(long)]
         push: bool,
         #[arg(long)]
@@ -225,6 +229,8 @@ pub fn run() -> Result<()> {
             branch,
             docker,
             image,
+            push_image,
+            verify_image,
             push,
             backend,
             targets,
@@ -235,6 +241,8 @@ pub fn run() -> Result<()> {
                     branch,
                     docker,
                     image,
+                    push_image,
+                    verify_image,
                     in_place,
                     events,
                     reproducible,
@@ -245,7 +253,16 @@ pub fn run() -> Result<()> {
             }
             if BuildConfig::exists(&config) {
                 let mut cfg = BuildConfig::from_file(&config)?;
-                apply_build_cli_overrides(&mut cfg, docker, image, push, backend, targets);
+                apply_build_cli_overrides(
+                    &mut cfg,
+                    docker,
+                    image,
+                    push_image,
+                    verify_image,
+                    push,
+                    backend,
+                    targets,
+                );
                 let mut build_mode = None;
                 if all {
                     build_mode = Some("all".to_string());
@@ -281,7 +298,16 @@ pub fn run() -> Result<()> {
                 );
                 let cfg = BuildConfig::for_local_workspace()?;
                 let mut cfg = cfg;
-                apply_build_cli_overrides(&mut cfg, docker, image, push, backend, targets);
+                apply_build_cli_overrides(
+                    &mut cfg,
+                    docker,
+                    image,
+                    push_image,
+                    verify_image,
+                    push,
+                    backend,
+                    targets,
+                );
                 BuildEngine::from_config(cfg)
                     .with_in_place(true)
                     .with_events(events)
@@ -553,6 +579,8 @@ fn run_deploy(
         branch.clone(),
         should_use_container,
         Some(image_tag.clone()),
+        None,
+        None,
         in_place,
         None,
         None,
@@ -1545,6 +1573,8 @@ fn deploy_artifact_root_for_source(
             artifact_dir: normalize_display_path(&default_artifact_dir()),
             targets: Some(vec!["directory".to_string()]),
             container_image: None,
+            push_container_image: None,
+            verify_container_image: None,
             container_platforms: None,
             push_container: Some(false),
             container_backend: None,
@@ -1927,6 +1957,8 @@ fn run_quick_build(
     git_branch: Option<String>,
     docker: bool,
     image: Option<String>,
+    push_image: Option<String>,
+    verify_image: Option<String>,
     in_place: bool,
     events: Option<bool>,
     reproducible: bool,
@@ -1939,6 +1971,8 @@ fn run_quick_build(
         git_branch,
         docker,
         image,
+        push_image,
+        verify_image,
         in_place,
         events,
         None,
@@ -1959,6 +1993,8 @@ fn run_quick_build_with_options(
     git_branch: Option<String>,
     docker: bool,
     image: Option<String>,
+    push_image: Option<String>,
+    verify_image: Option<String>,
     in_place: bool,
     events: Option<bool>,
     rebase_base: Option<String>,
@@ -1976,6 +2012,8 @@ fn run_quick_build_with_options(
     let mut targets = explicit_targets.unwrap_or_else(|| vec!["directory".to_string()]);
     let wants_container = docker
         || image.is_some()
+        || push_image.is_some()
+        || verify_image.is_some()
         || push_container
         || container_backend.is_some()
         || targets.iter().any(|t| t == "container_image");
@@ -1983,6 +2021,8 @@ fn run_quick_build_with_options(
         targets.push("container_image".to_string());
     }
     let image_tag = image.unwrap_or_else(|| format!("{name}:latest"));
+    let push_enabled = push_container || push_image.is_some() || verify_image.is_some();
+    let verify_enabled = verify_image.is_some() || push_enabled;
 
     let cfg = BuildConfig {
         project: ProjectConfig {
@@ -2005,10 +2045,12 @@ fn run_quick_build_with_options(
             } else {
                 None
             },
+            push_container_image: if wants_container { push_image } else { None },
+            verify_container_image: if wants_container { verify_image } else { None },
             container_platforms: None,
-            push_container: Some(push_container),
+            push_container: Some(push_enabled),
             container_backend,
-            verify_container_push: Some(push_container),
+            verify_container_push: Some(verify_enabled),
             fail_if_container_unavailable: Some(wants_container),
             rebase_base,
             kubernetes: None,
@@ -2110,6 +2152,8 @@ fn apply_build_cli_overrides(
     cfg: &mut BuildConfig,
     docker: bool,
     image: Option<String>,
+    push_image: Option<String>,
+    verify_image: Option<String>,
     push: bool,
     backend: Option<String>,
     targets: Vec<String>,
@@ -2127,6 +2171,8 @@ fn apply_build_cli_overrides(
     };
     let wants_container = docker
         || image.is_some()
+        || push_image.is_some()
+        || verify_image.is_some()
         || push
         || backend.is_some()
         || normalized_targets.iter().any(|t| t == "container_image");
@@ -2138,8 +2184,19 @@ fn apply_build_cli_overrides(
         if let Some(tag) = image {
             cfg.deploy.container_image = Some(tag);
         }
-        if push {
+        if let Some(tag) = push_image {
+            cfg.deploy.push_container_image = Some(tag);
+        }
+        if let Some(tag) = verify_image {
+            cfg.deploy.verify_container_image = Some(tag);
+        }
+        if push
+            || cfg.deploy.push_container_image.is_some()
+            || cfg.deploy.verify_container_image.is_some()
+        {
             cfg.deploy.push_container = Some(true);
+        }
+        if push || cfg.deploy.verify_container_image.is_some() {
             cfg.deploy.verify_container_push = Some(true);
         }
         if let Some(selected_backend) = backend {
@@ -2597,6 +2654,8 @@ fn run_rebase(
             branch_ref,
             true,
             Some(target_image),
+            None,
+            None,
             false,
             None,
             runtime_base,
@@ -2810,4 +2869,98 @@ fn file_contains(path: &Path, needle: &str) -> bool {
 
 fn normalize_display_path(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> BuildConfig {
+        BuildConfig {
+            project: ProjectConfig {
+                name: "app".to_string(),
+                language: None,
+            },
+            workspace: None,
+            packages: None,
+            source: None,
+            build: None,
+            deploy: DeployConfig {
+                artifact_dir: normalize_display_path(&default_artifact_dir()),
+                targets: Some(vec!["directory".to_string()]),
+                container_image: None,
+                push_container_image: None,
+                verify_container_image: None,
+                container_platforms: None,
+                push_container: Some(false),
+                container_backend: None,
+                verify_container_push: Some(false),
+                fail_if_container_unavailable: Some(false),
+                rebase_base: None,
+                kubernetes: None,
+                gc: None,
+            },
+            output: None,
+            cache: None,
+            scan: None,
+            security: None,
+            env: None,
+            env_from_host: None,
+            sandbox: None,
+            signing: None,
+            compatibility: None,
+        }
+    }
+
+    #[test]
+    fn build_cli_overrides_enable_distinct_push_and_verify_images() {
+        let mut cfg = test_config();
+        apply_build_cli_overrides(
+            &mut cfg,
+            false,
+            Some("localhost:5000/runtime/app:latest".to_string()),
+            Some("host.docker.internal:5000/runtime/app:latest".to_string()),
+            Some("registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest".to_string()),
+            false,
+            Some("docker".to_string()),
+            vec!["container_image".to_string()],
+        );
+
+        assert_eq!(
+            cfg.deploy.container_image.as_deref(),
+            Some("localhost:5000/runtime/app:latest")
+        );
+        assert_eq!(
+            cfg.deploy.push_container_image.as_deref(),
+            Some("host.docker.internal:5000/runtime/app:latest")
+        );
+        assert_eq!(
+            cfg.deploy.verify_container_image.as_deref(),
+            Some("registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest")
+        );
+        assert_eq!(cfg.deploy.push_container, Some(true));
+        assert_eq!(cfg.deploy.verify_container_push, Some(true));
+        assert_eq!(cfg.deploy.container_backend.as_deref(), Some("docker"));
+    }
+
+    #[test]
+    fn build_cli_overrides_infer_container_target_from_push_image() {
+        let mut cfg = test_config();
+        apply_build_cli_overrides(
+            &mut cfg,
+            false,
+            None,
+            Some("registry.example.com/sendara/app:latest".to_string()),
+            None,
+            false,
+            None,
+            vec![],
+        );
+
+        assert_eq!(
+            cfg.deploy.targets.as_deref(),
+            Some(&["directory".to_string(), "container_image".to_string()][..])
+        );
+        assert_eq!(cfg.deploy.push_container, Some(true));
+    }
 }

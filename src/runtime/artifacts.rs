@@ -33,6 +33,8 @@ pub struct GarbageCollectResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ContainerPublishSummary {
     pub container_image: String,
+    pub pushed_image: Option<String>,
+    pub verified_image: Option<String>,
     pub backend_used: String,
     pub pushed: bool,
     pub registry_manifest_verified: bool,
@@ -46,11 +48,21 @@ pub struct ContainerPublishSummary {
 pub struct ContainerPublishOptions {
     pub platforms: Vec<String>,
     pub push: bool,
+    pub push_image: Option<String>,
+    pub verify_image: Option<String>,
     pub backend: Option<String>,
     pub verify_push: bool,
     pub fail_if_container_unavailable: bool,
     pub registry_cache_ref: Option<String>,
     pub rebase_base: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedContainerTargets {
+    push_image: Option<String>,
+    verify_image: Option<String>,
+    needs_separate_push: bool,
+    push_during_build: bool,
 }
 
 pub fn make_workdir(project: &str) -> Result<PathBuf> {
@@ -112,8 +124,10 @@ pub fn publish(
                 let publish = build_container_image(container_src, image, container_options)?;
                 let out = root.join(format!("container-image-{image}.txt"));
                 let note = format!(
-                    "image={}\nbackend_used={}\npushed={}\nregistry_manifest_verified={}\ndockerfile_generated={}\nlayered_dockerfile_generated={}\ndockerignore_generated={}\ncontext={}\n",
+                    "image={}\npushed_image={}\nverified_image={}\nbackend_used={}\npushed={}\nregistry_manifest_verified={}\ndockerfile_generated={}\nlayered_dockerfile_generated={}\ndockerignore_generated={}\ncontext={}\n",
                     publish.container_image,
+                    publish.pushed_image.as_deref().unwrap_or(""),
+                    publish.verified_image.as_deref().unwrap_or(""),
                     publish.backend_used,
                     publish.pushed,
                     publish.registry_manifest_verified,
@@ -330,8 +344,24 @@ fn build_container_image(
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>();
+    let resolved_targets = resolve_container_publish_targets(image, &opts);
+    let push_image = resolved_targets.push_image.as_deref().unwrap_or(image);
+    let verify_image = resolved_targets.verify_image.as_deref();
+    let needs_separate_push = resolved_targets.needs_separate_push;
+    let push_during_build = resolved_targets.push_during_build;
+
     if !platforms.is_empty() && !opts.push {
         anyhow::bail!("multi-arch container build requires [deploy].push_container = true");
+    }
+    if !platforms.is_empty() && needs_separate_push {
+        anyhow::bail!(
+            "multi-arch container build does not support a distinct push_container_image; push the build image directly"
+        );
+    }
+    if matches!(backend, ContainerBackend::Buildkit) && needs_separate_push {
+        anyhow::bail!(
+            "buildkit backend does not support a distinct push_container_image; use the build image as the push target"
+        );
     }
 
     backend.build(
@@ -340,7 +370,7 @@ fn build_container_image(
         &dockerfile_for_build,
         &platforms,
         opts.registry_cache_ref.as_deref(),
-        opts.push,
+        push_during_build,
     )?;
 
     if use_layered {
@@ -348,16 +378,27 @@ fn build_container_image(
     }
 
     let mut registry_manifest_verified = false;
+    let mut pushed_image = None;
+    let mut verified_image = None;
     if opts.push {
-        backend.push(image)?;
-        if opts.verify_push {
+        if needs_separate_push {
+            backend.tag(image, push_image)?;
+        }
+        if !push_during_build || needs_separate_push {
+            backend.push(push_image)?;
+        }
+        pushed_image = Some(push_image.to_string());
+        if let Some(image) = verify_image {
             verify_registry_manifest(image)?;
             registry_manifest_verified = true;
+            verified_image = Some(image.to_string());
         }
     }
 
     Ok(ContainerPublishSummary {
         container_image: image.to_string(),
+        pushed_image,
+        verified_image,
         backend_used: backend.as_str().to_string(),
         pushed: opts.push,
         registry_manifest_verified,
@@ -366,6 +407,39 @@ fn build_container_image(
         layered_dockerfile_generated: generated_layered_dockerfile,
         context: container_src_display(src),
     })
+}
+
+fn resolve_container_publish_targets(
+    image: &str,
+    opts: &ContainerPublishOptions,
+) -> ResolvedContainerTargets {
+    let push_image = if opts.push {
+        Some(opts.push_image.clone().unwrap_or_else(|| image.to_string()))
+    } else {
+        None
+    };
+    let verify_image = if opts.push {
+        opts.verify_image.clone().or_else(|| {
+            if opts.verify_push {
+                push_image.clone()
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let needs_separate_push = push_image
+        .as_deref()
+        .map(|tag| tag != image)
+        .unwrap_or(false);
+    let push_during_build = opts.push && !needs_separate_push;
+    ResolvedContainerTargets {
+        push_image,
+        verify_image,
+        needs_separate_push,
+        push_during_build,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -439,6 +513,31 @@ impl ContainerBackend {
         };
         if !status.success() {
             anyhow::bail!("{} push failed", self.as_str());
+        }
+        Ok(())
+    }
+
+    fn tag(self, source: &str, target: &str) -> Result<()> {
+        if source == target {
+            return Ok(());
+        }
+        if matches!(self, Self::Buildkit) {
+            anyhow::bail!("buildkit does not support local image retagging");
+        }
+        let status = match self {
+            Self::Docker => Command::new("docker")
+                .args(["tag", source, target])
+                .status()?,
+            Self::Podman => Command::new("podman")
+                .args(["tag", source, target])
+                .status()?,
+            Self::Buildah => Command::new("buildah")
+                .args(["tag", source, target])
+                .status()?,
+            Self::Buildkit => unreachable!(),
+        };
+        if !status.success() {
+            anyhow::bail!("{} tag failed", self.as_str());
         }
         Ok(())
     }
@@ -1834,7 +1933,10 @@ fn should_skip_workspace_dir(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_container_backend, parse_image_reference, ContainerBackend};
+    use super::{
+        parse_container_backend, parse_image_reference, resolve_container_publish_targets,
+        ContainerBackend, ContainerPublishOptions,
+    };
 
     #[test]
     fn parses_default_docker_hub_reference() {
@@ -1881,5 +1983,48 @@ mod tests {
             parse_container_backend("buildkit").expect("backend"),
             ContainerBackend::Buildkit
         ));
+    }
+
+    #[test]
+    fn resolves_distinct_push_and_verify_images() {
+        let resolved = resolve_container_publish_targets(
+            "localhost:5000/runtime/app:latest",
+            &ContainerPublishOptions {
+                push: true,
+                push_image: Some("host.docker.internal:5000/runtime/app:latest".to_string()),
+                verify_image: Some(
+                    "registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolved.push_image.as_deref(),
+            Some("host.docker.internal:5000/runtime/app:latest")
+        );
+        assert_eq!(
+            resolved.verify_image.as_deref(),
+            Some("registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest")
+        );
+        assert!(resolved.needs_separate_push);
+        assert!(!resolved.push_during_build);
+    }
+
+    #[test]
+    fn falls_back_to_push_image_for_verification() {
+        let resolved = resolve_container_publish_targets(
+            "sendara/app:latest",
+            &ContainerPublishOptions {
+                push: true,
+                push_image: Some("registry.example.com/sendara/app:latest".to_string()),
+                verify_push: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolved.verify_image.as_deref(),
+            Some("registry.example.com/sendara/app:latest")
+        );
     }
 }

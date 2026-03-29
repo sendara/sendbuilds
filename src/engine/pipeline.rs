@@ -587,9 +587,15 @@ impl BuildEngine {
                     .and_then(|s| s.key_env.clone())
                     .unwrap_or_else(|| "SENDBUILD_SIGNING_KEY".to_string());
                 if let Some(p) = &publish_result {
+                    let signing_image = p.container_publish.as_ref().and_then(|summary| {
+                        summary
+                            .pushed_image
+                            .clone()
+                            .or_else(|| Some(summary.container_image.clone()))
+                    });
                     let provenance_options = signing::ProvenanceOptions {
                         project_name: cfg.project.name.clone(),
-                        container_image: cfg.deploy.container_image.clone(),
+                        container_image: signing_image,
                         cosign: cfg.signing.as_ref().and_then(|s| s.cosign).unwrap_or(false),
                         cosign_key: cfg.signing.as_ref().and_then(|s| s.cosign_key.clone()),
                         cosign_keyless: cfg
@@ -1370,13 +1376,17 @@ impl BuildEngine {
                 .container_platforms
                 .clone()
                 .unwrap_or_default(),
-            push: self.config.deploy.push_container.unwrap_or(false),
+            push: self.config.deploy.push_container.unwrap_or(false)
+                || self.config.deploy.push_container_image.is_some()
+                || self.config.deploy.verify_container_image.is_some(),
+            push_image: self.config.deploy.push_container_image.clone(),
+            verify_image: self.config.deploy.verify_container_image.clone(),
             backend: self.config.deploy.container_backend.clone(),
-            verify_push: self
-                .config
-                .deploy
-                .verify_container_push
-                .unwrap_or(self.config.deploy.push_container.unwrap_or(false)),
+            verify_push: self.config.deploy.verify_container_push.unwrap_or(
+                self.config.deploy.push_container.unwrap_or(false)
+                    || self.config.deploy.push_container_image.is_some()
+                    || self.config.deploy.verify_container_image.is_some(),
+            ),
             fail_if_container_unavailable: self
                 .config
                 .deploy

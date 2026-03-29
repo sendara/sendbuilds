@@ -121,8 +121,8 @@ If `[source]` is omitted in `sendbuild.toml`, `sendbuilds` uses the current work
 sendbuilds build [--config sendbuild.toml] [--events true|false]
 sendbuilds build [--config sendbuild.toml] [--in-place] [--events true|false]
 sendbuilds build [--config sendbuild.toml] [--reproducible]
-sendbuilds build [--config sendbuild.toml] [--image <tag>] [--push] [--backend <docker|podman|buildah|buildkit>] [--target <directory|tarball|serverless|kubernetes|container_image>]
-sendbuilds build --git <repo> --docker [--branch <name>] [--image <tag>] [--push] [--backend <docker|podman|buildah|buildkit>] [--target <directory|tarball|serverless|kubernetes|container_image>]
+sendbuilds build [--config sendbuild.toml] [--image <tag>] [--push-image <tag>] [--verify-image <tag>] [--push] [--backend <docker|podman|buildah|buildkit>] [--target <directory|tarball|serverless|kubernetes|container_image>]
+sendbuilds build --git <repo> --docker [--branch <name>] [--image <tag>] [--push-image <tag>] [--verify-image <tag>] [--push] [--backend <docker|podman|buildah|buildkit>] [--target <directory|tarball|serverless|kubernetes|container_image>]
 sendbuilds deploy [<owner/repo|git-url>] [--local] [--build] [--branch <name>] [--docker] [--target <kubernetes|serverless|tarball|directory|container_image>] [--image <tag>] [--dry-run] [--remote]
 sendbuilds debug <build-id> [--config sendbuild.toml]
 sendbuilds replay [<build-id>] [--buildid <build-id>] [--time-machine <date>] [--config sendbuild.toml]
@@ -303,6 +303,8 @@ output_dir = ".next"                                             # optional over
 artifact_dir = "./artifacts"
 targets = ["directory", "tarball", "serverless_zip", "container_image", "kubernetes"] # optional
 container_image = "my-app:latest"                                       # optional
+push_container_image = "registry.example.com/my-app:latest"             # optional: tag/push target if different from build image
+verify_container_image = "registry.internal/my-app:latest"              # optional: registry reference used for manifest verification
 container_platforms = ["linux/amd64", "linux/arm64"]                    # optional (buildx)
 push_container = true                                                    # optional (required for multi-arch)
 container_backend = "docker"                                             # optional: docker|podman|buildah|buildkit
@@ -375,6 +377,8 @@ Container publishing example:
 [deploy]
 targets = ["container_image"]
 container_image = "registry.example.com/app:latest"
+push_container_image = "registry.example.com/app:latest"
+verify_container_image = "registry.example.com/app:latest"
 push_container = true
 container_backend = "docker"
 verify_container_push = true
@@ -387,6 +391,7 @@ CLI examples:
 sendbuilds build --image registry.example.com/app:latest --push
 sendbuilds build --image registry.example.com/app:latest --backend podman
 sendbuilds build --image registry.example.com/app:latest --target container_image
+sendbuilds build --image localhost:5000/runtime/app:latest --push-image host.docker.internal:5000/runtime/app:latest --verify-image registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest --push --backend docker --target container_image
 ```
 
 Successful container publish metadata is emitted as machine-readable JSON in `container-publish.json` and embedded in `build-metrics.json`, for example:
