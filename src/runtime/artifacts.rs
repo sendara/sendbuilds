@@ -145,8 +145,11 @@ pub fn publish(
                 container_publish = Some(publish);
             }
             "kubernetes" | "k8s" | "kubernetes_deployment" => {
-                let image = container_image.unwrap_or("sendbuild:latest");
-                let out = create_kubernetes_manifests(&root, project_name, image, kubernetes)?;
+                let image = resolve_deploy_image_reference(
+                    container_image.unwrap_or("sendbuild:latest"),
+                    container_options,
+                );
+                let out = create_kubernetes_manifests(&root, project_name, &image, kubernetes)?;
                 outputs.push(out);
             }
             other => warnings.push(format!("unknown output target: {other}")),
@@ -440,6 +443,17 @@ fn resolve_container_publish_targets(
         needs_separate_push,
         push_during_build,
     }
+}
+
+fn resolve_deploy_image_reference(image: &str, opts: Option<&ContainerPublishOptions>) -> String {
+    let Some(opts) = opts else {
+        return image.to_string();
+    };
+    let resolved = resolve_container_publish_targets(image, opts);
+    resolved
+        .verify_image
+        .or(resolved.push_image)
+        .unwrap_or_else(|| image.to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1935,7 +1949,7 @@ fn should_skip_workspace_dir(name: &str) -> bool {
 mod tests {
     use super::{
         parse_container_backend, parse_image_reference, resolve_container_publish_targets,
-        ContainerBackend, ContainerPublishOptions,
+        resolve_deploy_image_reference, ContainerBackend, ContainerPublishOptions,
     };
 
     #[test]
@@ -2026,5 +2040,34 @@ mod tests {
             resolved.verify_image.as_deref(),
             Some("registry.example.com/sendara/app:latest")
         );
+    }
+
+    #[test]
+    fn deploy_image_prefers_verified_or_pushed_reference() {
+        let image = resolve_deploy_image_reference(
+            "localhost:5000/runtime/app:latest",
+            Some(&ContainerPublishOptions {
+                push: true,
+                push_image: Some("host.docker.internal:5000/runtime/app:latest".to_string()),
+                verify_image: Some(
+                    "registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest"
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            image,
+            "registry.sendara-runtime.svc.cluster.local:5000/runtime/app:latest"
+        );
+    }
+
+    #[test]
+    fn deploy_image_stays_local_when_not_pushed() {
+        let image = resolve_deploy_image_reference(
+            "localhost:5000/runtime/app:latest",
+            Some(&ContainerPublishOptions::default()),
+        );
+        assert_eq!(image, "localhost:5000/runtime/app:latest");
     }
 }
