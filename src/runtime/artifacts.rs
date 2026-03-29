@@ -39,6 +39,7 @@ pub struct ContainerPublishSummary {
     pub backend_used: String,
     pub pushed: bool,
     pub registry_manifest_verified: bool,
+    pub warnings: Vec<String>,
     pub dockerfile_generated: bool,
     pub dockerignore_generated: bool,
     pub layered_dockerfile_generated: bool,
@@ -143,6 +144,7 @@ pub fn publish(
                 let json_out = root.join("container-publish.json");
                 fs::write(&json_out, serde_json::to_vec_pretty(&publish)?)?;
                 outputs.push(json_out);
+                warnings.extend(publish.warnings.iter().cloned());
                 container_publish = Some(publish);
             }
             "kubernetes" | "k8s" | "kubernetes_deployment" => {
@@ -384,6 +386,7 @@ fn build_container_image(
     let mut registry_manifest_verified = false;
     let mut pushed_image = None;
     let mut verified_image = None;
+    let mut warnings = Vec::new();
     if opts.push {
         if needs_separate_push {
             backend.tag(image, push_image)?;
@@ -393,9 +396,19 @@ fn build_container_image(
         }
         pushed_image = Some(push_image.to_string());
         if let Some(image) = verify_image {
-            verify_registry_manifest(image)?;
-            registry_manifest_verified = true;
-            verified_image = Some(image.to_string());
+            match verify_registry_manifest(image) {
+                Ok(()) => {
+                    registry_manifest_verified = true;
+                    verified_image = Some(image.to_string());
+                }
+                Err(err) if should_ignore_local_post_push_manifest_verification_failure(image, &err)
+                => {
+                    warnings.push(format!(
+                        "sendbuilds pushed the image successfully; ignoring post-push manifest verification failure for local registry. image={image} error={err}"
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -406,11 +419,29 @@ fn build_container_image(
         backend_used: backend.as_str().to_string(),
         pushed: opts.push,
         registry_manifest_verified,
+        warnings,
         dockerfile_generated: generated_dockerfile,
         dockerignore_generated: generated_dockerignore,
         layered_dockerfile_generated: generated_layered_dockerfile,
         context: container_src_display(src),
     })
+}
+
+fn should_ignore_local_post_push_manifest_verification_failure(
+    image: &str,
+    err: &anyhow::Error,
+) -> bool {
+    let Ok(reference) = parse_image_reference(image) else {
+        return false;
+    };
+    if !is_local_registry_host(&reference.registry) {
+        return false;
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("nothing accepted the connection")
+        || text.contains("connection refused")
+        || text.contains("client error (connect)")
+        || text.contains("tcp connect error")
 }
 
 fn resolve_container_publish_targets(
@@ -799,6 +830,15 @@ fn is_local_registry_url(manifest_url: &str) -> bool {
     manifest_url.contains("://localhost")
         || manifest_url.contains("://127.0.0.1")
         || manifest_url.contains("://[::1]")
+}
+
+fn is_local_registry_host(host: &str) -> bool {
+    host.starts_with("localhost:")
+        || host == "localhost"
+        || host.starts_with("127.0.0.1:")
+        || host == "127.0.0.1"
+        || host.starts_with("[::1]:")
+        || host == "[::1]"
 }
 
 fn ensure_registry_manifest_success(
@@ -2105,8 +2145,9 @@ mod tests {
     use super::{
         build_registry_manifest_request_error, is_local_registry_url, manifest_accept_header,
         parse_container_backend, parse_image_reference, parse_registry_error_payload,
-        ContainerBackend,
+        should_ignore_local_post_push_manifest_verification_failure, ContainerBackend,
     };
+    use anyhow::anyhow;
     #[test]
     fn parses_default_docker_hub_reference() {
         let parsed = parse_image_reference("sendara/app:latest").expect("image should parse");
@@ -2204,5 +2245,27 @@ mod tests {
         assert!(message.contains("failed to send registry manifest request"));
         assert!(message.contains("nothing accepted the connection"));
         assert!(message.contains("[deploy].verify_container_image"));
+    }
+
+    #[test]
+    fn ignores_local_post_push_manifest_verification_connection_failures() {
+        let err = anyhow!(
+            "failed to send registry manifest request for `localhost:30500/runtime/app:latest`: tcp connect error: Connection refused (os error 111)"
+        );
+        assert!(should_ignore_local_post_push_manifest_verification_failure(
+            "localhost:30500/runtime/app:latest",
+            &err
+        ));
+    }
+
+    #[test]
+    fn does_not_ignore_non_local_post_push_manifest_verification_failures() {
+        let err = anyhow!(
+            "failed to send registry manifest request for `registry.example.com/runtime/app:latest`: tcp connect error: Connection refused (os error 111)"
+        );
+        assert!(!should_ignore_local_post_push_manifest_verification_failure(
+            "registry.example.com/runtime/app:latest",
+            &err
+        ));
     }
 }
