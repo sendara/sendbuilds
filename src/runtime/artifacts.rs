@@ -3,9 +3,10 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
-use serde::Serialize;
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -730,9 +731,7 @@ fn verify_registry_manifest(image: &str) -> Result<()> {
         reference.scheme, reference.registry, reference.repository, reference.reference
     );
     let client = Client::builder().build()?;
-    let accept = manifest_accept_header();
-
-    let mut response = client.head(&manifest_url).header(ACCEPT, accept).send()?;
+    let mut response = send_registry_manifest_request(&client, &manifest_url, None, image)?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let challenge = response
@@ -742,20 +741,59 @@ fn verify_registry_manifest(image: &str) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("registry auth challenge missing for {image}"))?
             .to_string();
         let token = fetch_registry_bearer_token(&client, &challenge, &reference.repository)?;
-        response = client
-            .head(&manifest_url)
-            .header(ACCEPT, accept)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()?;
+        response = send_registry_manifest_request(&client, &manifest_url, Some(&token), image)?;
     }
 
-    if response.status() != reqwest::StatusCode::OK {
-        anyhow::bail!(
-            "registry manifest verification failed for `{image}` with status {}",
-            response.status()
-        );
-    }
+    ensure_registry_manifest_success(response, image, &manifest_url)?;
     Ok(())
+}
+
+fn send_registry_manifest_request(
+    client: &Client,
+    manifest_url: &str,
+    bearer_token: Option<&str>,
+    image: &str,
+) -> Result<Response> {
+    let mut request = client
+        .request(Method::GET, manifest_url)
+        .header(ACCEPT, manifest_accept_header());
+    if let Some(token) = bearer_token {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+
+    request
+        .send()
+        .with_context(|| format!("failed to request registry manifest for `{image}`"))
+}
+
+fn ensure_registry_manifest_success(
+    response: Response,
+    image: &str,
+    manifest_url: &str,
+) -> Result<()> {
+    let status = response.status();
+    if status == reqwest::StatusCode::OK {
+        return Ok(());
+    }
+
+    let details = describe_registry_response(response);
+    let message = match details {
+        Some(details) => format!(
+            "registry manifest verification failed for `{image}` at `{manifest_url}` with status {status}: {details}"
+        ),
+        None => format!(
+            "registry manifest verification failed for `{image}` at `{manifest_url}` with status {status}"
+        ),
+    };
+
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => anyhow::bail!("{message}"),
+        reqwest::StatusCode::FORBIDDEN => anyhow::bail!("{message}"),
+        reqwest::StatusCode::NOT_FOUND => anyhow::bail!("{message}"),
+        reqwest::StatusCode::TOO_MANY_REQUESTS => anyhow::bail!("{message}"),
+        _ if status.is_server_error() => anyhow::bail!("{message}"),
+        _ => anyhow::bail!("{message}"),
+    }
 }
 
 fn fetch_registry_bearer_token(
@@ -790,12 +828,21 @@ fn fetch_registry_bearer_token(
         .get("scope")
         .cloned()
         .unwrap_or_else(|| format!("repository:{repository}:pull"));
-    let response = request.query(&[("scope", scope.as_str())]).send()?;
+    let response = request
+        .query(&[("scope", scope.as_str())])
+        .send()
+        .with_context(|| format!("failed to request registry bearer token for `{repository}`"))?;
     if !response.status().is_success() {
-        anyhow::bail!(
-            "failed to fetch registry bearer token: {}",
-            response.status()
-        );
+        let status = response.status();
+        let details = describe_registry_response(response);
+        match details {
+            Some(details) => anyhow::bail!(
+                "failed to fetch registry bearer token for `{repository}` with status {status}: {details}"
+            ),
+            None => anyhow::bail!(
+                "failed to fetch registry bearer token for `{repository}` with status {status}"
+            ),
+        }
     }
     let body: Value = response.json()?;
     body.get("token")
@@ -806,7 +853,44 @@ fn fetch_registry_bearer_token(
 }
 
 fn manifest_accept_header() -> &'static str {
-    "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
+    "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json"
+}
+
+fn describe_registry_response(response: Response) -> Option<String> {
+    let body = response.text().ok()?;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    parse_registry_error_payload(body).or_else(|| Some(truncate_registry_body(body, 600)))
+}
+
+fn parse_registry_error_payload(body: &str) -> Option<String> {
+    let envelope = serde_json::from_str::<RegistryErrorEnvelope>(body).ok()?;
+    if envelope.errors.is_empty() {
+        return None;
+    }
+
+    let errors = envelope
+        .errors
+        .iter()
+        .map(RegistryErrorItem::describe)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    }
+}
+
+fn truncate_registry_body(body: &str, max_chars: usize) -> String {
+    if body.chars().count() <= max_chars {
+        return body.to_string();
+    }
+
+    let truncated = body.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
 }
 
 struct ParsedImageReference {
@@ -856,6 +940,42 @@ fn parse_image_reference(image: &str) -> Result<ParsedImageReference> {
         repository,
         reference,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryErrorEnvelope {
+    #[serde(default)]
+    errors: Vec<RegistryErrorItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryErrorItem {
+    code: Option<String>,
+    message: Option<String>,
+    detail: Option<Value>,
+}
+
+impl RegistryErrorItem {
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(code) = self.code.as_deref() {
+            parts.push(format!("code={code}"));
+        }
+        if let Some(message) = self.message.as_deref() {
+            parts.push(format!("message={message}"));
+        }
+        if let Some(detail) = self.detail.as_ref() {
+            if !detail.is_null() {
+                parts.push(format!("detail={detail}"));
+            }
+        }
+
+        if parts.is_empty() {
+            "registry returned an unspecified error".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 fn container_src_display(src: &Path) -> String {
@@ -1948,8 +2068,8 @@ fn should_skip_workspace_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_container_backend, parse_image_reference, resolve_container_publish_targets,
-        resolve_deploy_image_reference, ContainerBackend, ContainerPublishOptions,
+        manifest_accept_header, parse_container_backend, parse_image_reference,
+        parse_registry_error_payload, ContainerBackend,
     };
 
     #[test]
@@ -1977,6 +2097,31 @@ mod tests {
         assert_eq!(parsed.repository, "sendara/app");
         assert_eq!(parsed.reference, "test");
         assert_eq!(parsed.scheme, "http");
+    }
+
+    #[test]
+    fn manifest_accept_header_includes_docker_and_oci_indexes() {
+        let accept = manifest_accept_header();
+        assert!(accept.contains("application/vnd.docker.distribution.manifest.v2+json"));
+        assert!(accept.contains("application/vnd.docker.distribution.manifest.list.v2+json"));
+        assert!(accept.contains("application/vnd.oci.image.index.v1+json"));
+        assert!(accept.contains("application/vnd.oci.image.manifest.v1+json"));
+    }
+
+    #[test]
+    fn parses_registry_error_payload_with_code_and_message() {
+        let body = r#"{
+          "errors": [
+            {
+              "code": "MANIFEST_UNKNOWN",
+              "message": "OCI index found, but accept header does not support OCI indexes"
+            }
+          ]
+        }"#;
+        let parsed = parse_registry_error_payload(body).expect("payload should parse");
+        assert!(parsed.contains("code=MANIFEST_UNKNOWN"));
+        assert!(parsed
+            .contains("message=OCI index found, but accept header does not support OCI indexes"));
     }
 
     #[test]
