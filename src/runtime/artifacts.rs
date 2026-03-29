@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
+use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -18,6 +21,7 @@ pub struct PublishResult {
     pub root: PathBuf,
     pub outputs: Vec<PathBuf>,
     pub warnings: Vec<String>,
+    pub container_publish: Option<ContainerPublishSummary>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26,17 +30,25 @@ pub struct GarbageCollectResult {
     pub kept_dirs: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct ContainerBuildResult {
-    dockerfile_generated: bool,
-    dockerignore_generated: bool,
-    layered_dockerfile_generated: bool,
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerPublishSummary {
+    pub container_image: String,
+    pub backend_used: String,
+    pub pushed: bool,
+    pub registry_manifest_verified: bool,
+    pub dockerfile_generated: bool,
+    pub dockerignore_generated: bool,
+    pub layered_dockerfile_generated: bool,
+    pub context: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ContainerPublishOptions {
     pub platforms: Vec<String>,
     pub push: bool,
+    pub backend: Option<String>,
+    pub verify_push: bool,
+    pub fail_if_container_unavailable: bool,
     pub registry_cache_ref: Option<String>,
     pub rebase_base: Option<String>,
 }
@@ -75,6 +87,7 @@ pub fn publish(
 
     let mut outputs = Vec::new();
     let mut warnings = Vec::new();
+    let mut container_publish = None;
 
     for target in selected {
         match target.as_str() {
@@ -96,21 +109,26 @@ pub fn publish(
             }
             "container" | "container_image" => {
                 let image = container_image.unwrap_or("sendbuild:latest");
-                match build_container_image(container_src, image, container_options) {
-                    Ok(build_result) => {
-                        let out = root.join(format!("container-image-{image}.txt"));
-                        let note = format!(
-                            "image={image}\ndockerfile_generated={}\nlayered_dockerfile_generated={}\ndockerignore_generated={}\ncontext={}\n",
-                            build_result.dockerfile_generated,
-                            build_result.layered_dockerfile_generated,
-                            build_result.dockerignore_generated,
-                            container_src.display()
-                        );
-                        fs::write(&out, note)?;
-                        outputs.push(out);
-                    }
-                    Err(err) => warnings.push(format!("container image build skipped: {err}")),
-                }
+                let publish = build_container_image(container_src, image, container_options)?;
+                let out = root.join(format!("container-image-{image}.txt"));
+                let note = format!(
+                    "image={}\nbackend_used={}\npushed={}\nregistry_manifest_verified={}\ndockerfile_generated={}\nlayered_dockerfile_generated={}\ndockerignore_generated={}\ncontext={}\n",
+                    publish.container_image,
+                    publish.backend_used,
+                    publish.pushed,
+                    publish.registry_manifest_verified,
+                    publish.dockerfile_generated,
+                    publish.layered_dockerfile_generated,
+                    publish.dockerignore_generated,
+                    publish.context
+                );
+                fs::write(&out, note)?;
+                outputs.push(out);
+
+                let json_out = root.join("container-publish.json");
+                fs::write(&json_out, serde_json::to_vec_pretty(&publish)?)?;
+                outputs.push(json_out);
+                container_publish = Some(publish);
             }
             "kubernetes" | "k8s" | "kubernetes_deployment" => {
                 let image = container_image.unwrap_or("sendbuild:latest");
@@ -125,6 +143,7 @@ pub fn publish(
         root,
         outputs,
         warnings,
+        container_publish,
     })
 }
 
@@ -262,15 +281,17 @@ fn build_container_image(
     src: &Path,
     image: &str,
     options: Option<&ContainerPublishOptions>,
-) -> Result<ContainerBuildResult> {
-    let docker_available = Command::new("docker")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !docker_available {
-        anyhow::bail!("docker not available");
-    }
+) -> Result<ContainerPublishSummary> {
+    let opts = options.cloned().unwrap_or_default();
+    let backend = match resolve_container_backend(opts.backend.as_deref())? {
+        Some(backend) => backend,
+        None if opts.fail_if_container_unavailable => {
+            anyhow::bail!(
+                "container_image target requested but no supported container backend is available"
+            )
+        }
+        None => anyhow::bail!("no supported container backend available"),
+    };
 
     let dockerfile_path = src.join("Dockerfile");
     let layered_dockerfile_path = src.join("Dockerfile.sendbuild.layered");
@@ -290,7 +311,6 @@ fn build_container_image(
         }
     }
 
-    let opts = options.cloned().unwrap_or_default();
     let use_layered = generated_dockerfile
         || should_regenerate_generated_dockerfile(
             &fs::read_to_string(&dockerfile_path).unwrap_or_default(),
@@ -304,52 +324,205 @@ fn build_container_image(
         dockerfile_path.clone()
     };
 
-    let buildx_available = Command::new("docker")
-        .args(["buildx", "version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
     let platforms = opts
         .platforms
         .iter()
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>();
-    let use_buildx = buildx_available
-        && (!platforms.is_empty() || opts.registry_cache_ref.is_some() || opts.push);
     if !platforms.is_empty() && !opts.push {
         anyhow::bail!("multi-arch container build requires [deploy].push_container = true");
     }
 
-    let status = if use_buildx {
+    backend.build(
+        src,
+        image,
+        &dockerfile_for_build,
+        &platforms,
+        opts.registry_cache_ref.as_deref(),
+        opts.push,
+    )?;
+
+    if use_layered {
+        write_rebase_plan(src, image, opts.rebase_base.as_deref(), &platforms)?;
+    }
+
+    let mut registry_manifest_verified = false;
+    if opts.push {
+        backend.push(image)?;
+        if opts.verify_push {
+            verify_registry_manifest(image)?;
+            registry_manifest_verified = true;
+        }
+    }
+
+    Ok(ContainerPublishSummary {
+        container_image: image.to_string(),
+        backend_used: backend.as_str().to_string(),
+        pushed: opts.push,
+        registry_manifest_verified,
+        dockerfile_generated: generated_dockerfile,
+        dockerignore_generated: generated_dockerignore,
+        layered_dockerfile_generated: generated_layered_dockerfile,
+        context: container_src_display(src),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ContainerBackend {
+    Docker,
+    Podman,
+    Buildah,
+    Buildkit,
+}
+
+impl ContainerBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+            Self::Buildah => "buildah",
+            Self::Buildkit => "buildkit",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+            Self::Buildah => "buildah",
+            Self::Buildkit => "buildctl",
+        }
+    }
+
+    fn build(
+        self,
+        src: &Path,
+        image: &str,
+        dockerfile_for_build: &Path,
+        platforms: &[String],
+        registry_cache_ref: Option<&str>,
+        push: bool,
+    ) -> Result<()> {
+        let status = match self {
+            Self::Docker => build_with_docker(
+                src,
+                image,
+                dockerfile_for_build,
+                platforms,
+                registry_cache_ref,
+                push,
+            )?,
+            Self::Podman => build_with_podman(src, image, dockerfile_for_build, platforms)?,
+            Self::Buildah => build_with_buildah(src, image, dockerfile_for_build, platforms)?,
+            Self::Buildkit => {
+                build_with_buildkit(src, image, dockerfile_for_build, platforms, push)?
+            }
+        };
+        if !status.success() {
+            anyhow::bail!("{} build failed", self.as_str());
+        }
+        Ok(())
+    }
+
+    fn push(self, image: &str) -> Result<()> {
+        if matches!(self, Self::Buildkit) {
+            return Ok(());
+        }
+        let status = match self {
+            Self::Docker => Command::new("docker").args(["push", image]).status()?,
+            Self::Podman => Command::new("podman").args(["push", image]).status()?,
+            Self::Buildah => Command::new("buildah")
+                .args(["push", image, &format!("docker://{image}")])
+                .status()?,
+            Self::Buildkit => unreachable!(),
+        };
+        if !status.success() {
+            anyhow::bail!("{} push failed", self.as_str());
+        }
+        Ok(())
+    }
+}
+
+fn resolve_container_backend(explicit: Option<&str>) -> Result<Option<ContainerBackend>> {
+    if let Some(raw) = explicit {
+        let backend = parse_container_backend(raw)?;
+        if backend_available(backend) {
+            return Ok(Some(backend));
+        }
+        anyhow::bail!("configured container backend `{raw}` is not available");
+    }
+
+    Ok([
+        ContainerBackend::Docker,
+        ContainerBackend::Podman,
+        ContainerBackend::Buildah,
+        ContainerBackend::Buildkit,
+    ]
+    .into_iter()
+    .find(|backend| backend_available(*backend)))
+}
+
+fn parse_container_backend(raw: &str) -> Result<ContainerBackend> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "docker" => Ok(ContainerBackend::Docker),
+        "podman" => Ok(ContainerBackend::Podman),
+        "buildah" => Ok(ContainerBackend::Buildah),
+        "buildkit" => Ok(ContainerBackend::Buildkit),
+        other => anyhow::bail!("unsupported container backend `{other}`"),
+    }
+}
+
+fn backend_available(backend: ContainerBackend) -> bool {
+    Command::new(backend.command())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn build_with_docker(
+    src: &Path,
+    image: &str,
+    dockerfile_for_build: &Path,
+    platforms: &[String],
+    registry_cache_ref: Option<&str>,
+    push: bool,
+) -> Result<std::process::ExitStatus> {
+    let buildx_available = Command::new("docker")
+        .args(["buildx", "version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let use_buildx =
+        buildx_available && (!platforms.is_empty() || registry_cache_ref.is_some() || push);
+    if use_buildx {
         let mut cmd = Command::new("docker");
         cmd.arg("buildx")
             .arg("build")
             .arg("-t")
             .arg(image)
             .arg("--file")
-            .arg(&dockerfile_for_build)
+            .arg(dockerfile_for_build)
             .arg("--provenance=mode=max")
             .arg("--sbom=true");
         if !platforms.is_empty() {
             cmd.arg("--platform").arg(platforms.join(","));
         }
-        if let Some(cache_ref) = opts.registry_cache_ref.as_deref() {
+        if let Some(cache_ref) = registry_cache_ref {
             cmd.arg("--cache-from")
                 .arg(format!("type=registry,ref={cache_ref}"));
             cmd.arg("--cache-to")
                 .arg(format!("type=registry,ref={cache_ref},mode=max"));
         }
-        if opts.push {
+        if push {
             cmd.arg("--push");
         } else {
             cmd.arg("--load");
         }
-        cmd.arg(".");
-        cmd.current_dir(src).status()?
+        cmd.arg(".").current_dir(src).status().map_err(Into::into)
     } else {
-        if !platforms.is_empty() || opts.registry_cache_ref.is_some() || opts.push {
+        if !platforms.is_empty() || registry_cache_ref.is_some() || push {
             anyhow::bail!(
                 "docker buildx is required for multi-arch/cache/push container options; install buildx"
             );
@@ -359,24 +532,221 @@ fn build_container_image(
             .arg("-t")
             .arg(image)
             .arg("--file")
-            .arg(&dockerfile_for_build)
+            .arg(dockerfile_for_build)
             .arg(".")
             .current_dir(src)
-            .status()?
+            .status()
+            .map_err(Into::into)
+    }
+}
+
+fn build_with_podman(
+    src: &Path,
+    image: &str,
+    dockerfile_for_build: &Path,
+    platforms: &[String],
+) -> Result<std::process::ExitStatus> {
+    let mut cmd = Command::new("podman");
+    cmd.arg("build")
+        .arg("-t")
+        .arg(image)
+        .arg("--file")
+        .arg(dockerfile_for_build);
+    if !platforms.is_empty() {
+        cmd.arg("--platform").arg(platforms.join(","));
+    }
+    cmd.arg(".").current_dir(src).status().map_err(Into::into)
+}
+
+fn build_with_buildah(
+    src: &Path,
+    image: &str,
+    dockerfile_for_build: &Path,
+    platforms: &[String],
+) -> Result<std::process::ExitStatus> {
+    let mut cmd = Command::new("buildah");
+    cmd.arg("bud")
+        .arg("-t")
+        .arg(image)
+        .arg("-f")
+        .arg(dockerfile_for_build);
+    if !platforms.is_empty() {
+        cmd.arg("--platform").arg(platforms.join(","));
+    }
+    cmd.arg(".").current_dir(src).status().map_err(Into::into)
+}
+
+fn build_with_buildkit(
+    src: &Path,
+    image: &str,
+    dockerfile_for_build: &Path,
+    platforms: &[String],
+    push: bool,
+) -> Result<std::process::ExitStatus> {
+    let dockerfile_name = dockerfile_for_build
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("invalid dockerfile path {}", dockerfile_for_build.display())
+        })?;
+    let mut output = format!("type=image,name={image},push={push}");
+    if !platforms.is_empty() {
+        output.push_str(&format!(",platform={}", platforms.join(",")));
+    }
+    Command::new("buildctl")
+        .arg("build")
+        .arg("--frontend")
+        .arg("dockerfile.v0")
+        .arg("--local")
+        .arg("context=.")
+        .arg("--local")
+        .arg("dockerfile=.")
+        .arg("--opt")
+        .arg(format!("filename={dockerfile_name}"))
+        .arg("--output")
+        .arg(output)
+        .current_dir(src)
+        .status()
+        .map_err(Into::into)
+}
+
+fn verify_registry_manifest(image: &str) -> Result<()> {
+    let reference = parse_image_reference(image)?;
+    let manifest_url = format!(
+        "{}://{}/v2/{}/manifests/{}",
+        reference.scheme, reference.registry, reference.repository, reference.reference
+    );
+    let client = Client::builder().build()?;
+    let accept = manifest_accept_header();
+
+    let mut response = client.head(&manifest_url).header(ACCEPT, accept).send()?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let challenge = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("registry auth challenge missing for {image}"))?
+            .to_string();
+        let token = fetch_registry_bearer_token(&client, &challenge, &reference.repository)?;
+        response = client
+            .head(&manifest_url)
+            .header(ACCEPT, accept)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .send()?;
+    }
+
+    if response.status() != reqwest::StatusCode::OK {
+        anyhow::bail!(
+            "registry manifest verification failed for `{image}` with status {}",
+            response.status()
+        );
+    }
+    Ok(())
+}
+
+fn fetch_registry_bearer_token(
+    client: &Client,
+    challenge: &str,
+    repository: &str,
+) -> Result<String> {
+    let (scheme, params) = challenge
+        .split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("invalid auth challenge `{challenge}`"))?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        anyhow::bail!("unsupported registry auth scheme `{scheme}`");
+    }
+
+    let pairs = params
+        .split(',')
+        .filter_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            Some((key.trim(), value.trim().trim_matches('"').to_string()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let realm = pairs
+        .get("realm")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("registry auth challenge missing realm"))?;
+
+    let mut request = client.get(realm);
+    if let Some(service) = pairs.get("service") {
+        request = request.query(&[("service", service)]);
+    }
+    let scope = pairs
+        .get("scope")
+        .cloned()
+        .unwrap_or_else(|| format!("repository:{repository}:pull"));
+    let response = request.query(&[("scope", scope.as_str())]).send()?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "failed to fetch registry bearer token: {}",
+            response.status()
+        );
+    }
+    let body: Value = response.json()?;
+    body.get("token")
+        .or_else(|| body.get("access_token"))
+        .and_then(Value::as_str)
+        .map(|token| token.to_string())
+        .ok_or_else(|| anyhow::anyhow!("registry bearer token response missing token"))
+}
+
+fn manifest_accept_header() -> &'static str {
+    "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
+}
+
+struct ParsedImageReference {
+    scheme: &'static str,
+    registry: String,
+    repository: String,
+    reference: String,
+}
+
+fn parse_image_reference(image: &str) -> Result<ParsedImageReference> {
+    let last_slash = image.rfind('/');
+    let last_colon = image.rfind(':');
+    let (name_part, reference) = match (last_slash, last_colon) {
+        (_, Some(colon)) if last_slash.map(|slash| colon > slash).unwrap_or(true) => {
+            (&image[..colon], image[colon + 1..].to_string())
+        }
+        _ => (image, "latest".to_string()),
     };
-    if !status.success() {
-        anyhow::bail!("docker build failed");
-    }
 
-    if use_layered {
-        write_rebase_plan(src, image, opts.rebase_base.as_deref(), &platforms)?;
+    let parts = name_part.split('/').collect::<Vec<_>>();
+    let (registry, repository) = if parts.len() > 1
+        && (parts[0].contains('.') || parts[0].contains(':') || parts[0] == "localhost")
+    {
+        (parts[0].to_string(), parts[1..].join("/"))
+    } else if parts.len() == 1 {
+        (
+            "registry-1.docker.io".to_string(),
+            format!("library/{}", parts[0]),
+        )
+    } else {
+        ("registry-1.docker.io".to_string(), parts.join("/"))
+    };
+    if repository.trim().is_empty() {
+        anyhow::bail!("invalid container image reference `{image}`");
     }
-
-    Ok(ContainerBuildResult {
-        dockerfile_generated: generated_dockerfile,
-        dockerignore_generated: generated_dockerignore,
-        layered_dockerfile_generated: generated_layered_dockerfile,
+    let scheme = if registry.starts_with("localhost")
+        || registry.starts_with("127.0.0.1")
+        || registry.starts_with("0.0.0.0")
+    {
+        "http"
+    } else {
+        "https"
+    };
+    Ok(ParsedImageReference {
+        scheme,
+        registry,
+        repository,
+        reference,
     })
+}
+
+fn container_src_display(src: &Path) -> String {
+    src.display().to_string()
 }
 
 fn build_layered_dockerfile(src: &Path, rebase_base: Option<&str>) -> Result<String> {
@@ -1460,4 +1830,56 @@ fn should_skip_workspace_dir(name: &str) -> bool {
             | ".idea"
             | ".vscode"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_container_backend, parse_image_reference, ContainerBackend};
+
+    #[test]
+    fn parses_default_docker_hub_reference() {
+        let parsed = parse_image_reference("sendara/app:latest").expect("image should parse");
+        assert_eq!(parsed.registry, "registry-1.docker.io");
+        assert_eq!(parsed.repository, "sendara/app");
+        assert_eq!(parsed.reference, "latest");
+        assert_eq!(parsed.scheme, "https");
+    }
+
+    #[test]
+    fn parses_single_segment_as_library_repo() {
+        let parsed = parse_image_reference("alpine").expect("image should parse");
+        assert_eq!(parsed.registry, "registry-1.docker.io");
+        assert_eq!(parsed.repository, "library/alpine");
+        assert_eq!(parsed.reference, "latest");
+    }
+
+    #[test]
+    fn parses_local_registry_reference() {
+        let parsed =
+            parse_image_reference("localhost:5000/sendara/app:test").expect("image should parse");
+        assert_eq!(parsed.registry, "localhost:5000");
+        assert_eq!(parsed.repository, "sendara/app");
+        assert_eq!(parsed.reference, "test");
+        assert_eq!(parsed.scheme, "http");
+    }
+
+    #[test]
+    fn parses_supported_container_backends() {
+        assert!(matches!(
+            parse_container_backend("docker").expect("backend"),
+            ContainerBackend::Docker
+        ));
+        assert!(matches!(
+            parse_container_backend("podman").expect("backend"),
+            ContainerBackend::Podman
+        ));
+        assert!(matches!(
+            parse_container_backend("buildah").expect("backend"),
+            ContainerBackend::Buildah
+        ));
+        assert!(matches!(
+            parse_container_backend("buildkit").expect("backend"),
+            ContainerBackend::Buildkit
+        ));
+    }
 }

@@ -24,3 +24,4 @@ flate2 = "1"
 tar = "0.4"
 zip = "2"
 getrandom = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

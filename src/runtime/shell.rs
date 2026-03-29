@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 static SANDBOX_STRICT: AtomicBool = AtomicBool::new(false);
 
@@ -134,7 +134,11 @@ where
     })
 }
 
-fn spawn_pipe_reader<R>(reader: R, stream_name: &'static str, tx: Sender<String>) -> thread::JoinHandle<()>
+fn spawn_pipe_reader<R>(
+    reader: R,
+    stream_name: &'static str,
+    tx: Sender<String>,
+) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {

@@ -691,6 +691,7 @@ impl BuildEngine {
                 "cache": cache_metrics,
                 "source_fingerprint": if source_fingerprint.is_empty() { None } else { Some(source_fingerprint.clone()) },
                 "dependency_fingerprint": if dependency_fingerprint.is_empty() { None } else { Some(dependency_fingerprint.clone()) },
+                "container_publish": publish_result.as_ref().and_then(|p| p.container_publish.clone()),
                 "security": &security_report,
                 "supply_chain_metadata": &supply_chain_metadata,
                 "steps": metrics_steps
@@ -951,16 +952,10 @@ impl BuildEngine {
         step: &mut Step,
     ) -> Result<shell::ShellRunOutput> {
         if self.reproducible {
-            let run = shell::run_allow_failure_with_line_handler(
-                cmd,
-                wd,
-                env,
-                sandbox,
-                |line| {
-                    step.push_log(line.to_string());
-                    log::pipe(line);
-                },
-            )?;
+            let run = shell::run_allow_failure_with_line_handler(cmd, wd, env, sandbox, |line| {
+                step.push_log(line.to_string());
+                log::pipe(line);
+            })?;
             if run.success {
                 return Ok(run);
             }
@@ -978,16 +973,10 @@ impl BuildEngine {
                 i + 1,
                 shell::redact_command_for_log(c)
             ));
-            let run = shell::run_allow_failure_with_line_handler(
-                c,
-                wd,
-                env,
-                sandbox,
-                |line| {
-                    step.push_log(line.to_string());
-                    log::pipe(line);
-                },
-            )?;
+            let run = shell::run_allow_failure_with_line_handler(c, wd, env, sandbox, |line| {
+                step.push_log(line.to_string());
+                log::pipe(line);
+            })?;
             if run.success {
                 return Ok(run);
             }
@@ -1382,6 +1371,21 @@ impl BuildEngine {
                 .clone()
                 .unwrap_or_default(),
             push: self.config.deploy.push_container.unwrap_or(false),
+            backend: self.config.deploy.container_backend.clone(),
+            verify_push: self
+                .config
+                .deploy
+                .verify_container_push
+                .unwrap_or(self.config.deploy.push_container.unwrap_or(false)),
+            fail_if_container_unavailable: self
+                .config
+                .deploy
+                .fail_if_container_unavailable
+                .unwrap_or(
+                    targets
+                        .iter()
+                        .any(|t| t == "container_image" || t == "container"),
+                ),
             registry_cache_ref,
             rebase_base: self.config.deploy.rebase_base.clone(),
         };

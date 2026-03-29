@@ -121,7 +121,8 @@ If `[source]` is omitted in `sendbuild.toml`, `sendbuilds` uses the current work
 sendbuilds build [--config sendbuild.toml] [--events true|false]
 sendbuilds build [--config sendbuild.toml] [--in-place] [--events true|false]
 sendbuilds build [--config sendbuild.toml] [--reproducible]
-sendbuilds build --git <repo> --docker [--branch <name>] [--image <tag>]
+sendbuilds build [--config sendbuild.toml] [--image <tag>] [--push] [--backend <docker|podman|buildah|buildkit>] [--target <directory|tarball|serverless|kubernetes|container_image>]
+sendbuilds build --git <repo> --docker [--branch <name>] [--image <tag>] [--push] [--backend <docker|podman|buildah|buildkit>] [--target <directory|tarball|serverless|kubernetes|container_image>]
 sendbuilds deploy [<owner/repo|git-url>] [--local] [--build] [--branch <name>] [--docker] [--target <kubernetes|serverless|tarball|directory|container_image>] [--image <tag>] [--dry-run] [--remote]
 sendbuilds debug <build-id> [--config sendbuild.toml]
 sendbuilds replay [<build-id>] [--buildid <build-id>] [--time-machine <date>] [--config sendbuild.toml]
@@ -140,6 +141,8 @@ sendbuilds rebase --git [--repo <git-url>] [--branch <name>] [--base <image>] [-
 Use `--in-place` to build directly in the current workspace instead of a temp copy (useful for Next.js `pnpm start` expecting `.next` in project root).
 If `sendbuild.toml` is missing, `sendbuilds build` automatically falls back to a smart local mode with inferred defaults and in-place build.
 For zero-config enterprise mode, use `sendbuilds build --git <repo> --docker`: it auto-generates runtime config, enables security-first checks, auto-generates a local signing key if missing, signs artifacts, emits SBOM/supply-chain metadata, and builds container images even when no Dockerfile exists.
+When `container_image` is requested, sendbuilds now treats container publish as required output: it must resolve a backend, build the image, and if push is enabled, push plus verify the registry manifest, or fail the command.
+Container backend selection order is: explicit `--backend`/`container_backend`, then `docker`, `podman`, `buildah`, and `buildkit`.
 Default storage paths are OS-aware under a `sendbuilds` data root:
 - Windows: `%LOCALAPPDATA%/sendbuilds`
 - macOS: `~/Library/Application Support/sendbuilds`
@@ -181,6 +184,7 @@ Local deploy does not require Docker unless you request `--docker` or `--target 
 When no explicit Docker/target flags are set, `deploy` auto-detects container need (for example from `sendbuild.toml` targets or local Dockerfile presence) and otherwise runs local non-container flow.
 In local non-container mode, `deploy` now reuses the latest existing `directory` artifact and starts it automatically when possible; if start detection fails, it exits with guidance instead of rebuilding silently.
 When container mode is active (`--docker` or container target), deploy also starts the built image as a local Docker container and prints published port mappings.
+If you explicitly request a container target and the required local runtime is unavailable, deploy now fails instead of silently skipping container output.
 
 ## Artifact Management
 
@@ -301,6 +305,9 @@ targets = ["directory", "tarball", "serverless_zip", "container_image", "kuberne
 container_image = "my-app:latest"                                       # optional
 container_platforms = ["linux/amd64", "linux/arm64"]                    # optional (buildx)
 push_container = true                                                    # optional (required for multi-arch)
+container_backend = "docker"                                             # optional: docker|podman|buildah|buildkit
+verify_container_push = true                                             # optional: verify registry manifest after push
+fail_if_container_unavailable = true                                     # optional: fail if container target requested but no backend is available
 rebase_base = "gcr.io/distroless/nodejs20-debian12"                     # optional runtime rebase base
 
 [deploy.kubernetes] # optional (used by target="kubernetes")
@@ -362,6 +369,37 @@ NODE_ENV = "production"
 API_BASE_URL = "https://api.example.com"
 ```
 
+Container publishing example:
+
+```toml
+[deploy]
+targets = ["container_image"]
+container_image = "registry.example.com/app:latest"
+push_container = true
+container_backend = "docker"
+verify_container_push = true
+fail_if_container_unavailable = true
+```
+
+CLI examples:
+
+```bash
+sendbuilds build --image registry.example.com/app:latest --push
+sendbuilds build --image registry.example.com/app:latest --backend podman
+sendbuilds build --image registry.example.com/app:latest --target container_image
+```
+
+Successful container publish metadata is emitted as machine-readable JSON in `container-publish.json` and embedded in `build-metrics.json`, for example:
+
+```json
+{
+  "container_image": "registry/sendara/app:tag",
+  "backend_used": "docker",
+  "pushed": true,
+  "registry_manifest_verified": true
+}
+```
+
 ## Step events
 
 When `[output].events = true` (or `--events true`), machine-readable step events are emitted to stdout:
@@ -391,6 +429,7 @@ EVENT {"type":"STEP_FAILED","channel":"build-step","step":"build","status":"fail
 15. First-class multi-arch container builds: optional `container_platforms` with buildx push flow.
 16. Provenance attestations and cosign integration: emits `provenance.intoto.jsonl`; optional cosign sign/attest.
 17. Deterministic reproducible mode: `build --reproducible` enforces locked inputs, isolated env, strict sandboxing, and deterministic install behavior.
+18. Strict container publish mode: `container_image` output is all-or-nothing, with backend resolution, optional push, and registry manifest verification.
 
 ## Security scan failure details
 
@@ -408,6 +447,7 @@ EVENT {"type":"STEP_FAILED","channel":"build-step","step":"security-scan","statu
 - Deploy artifacts are emitted under timestamped directories in `deploy.artifact_dir`.
 - With target `kubernetes`, `sendbuilds` writes `kubernetes/deployment.yaml` and `kubernetes/service.yaml` into the artifact root.
 - If `[deploy.gc].enabled = true`, old timestamped artifact directories are pruned automatically after deploy.
+- Container publish metadata is written to `container-publish.json` and included in `build-metrics.json` when a container image is built.
 - Security-first output is written to artifact root as `sbom.json`, `security-report.json`, and `supply-chain-metadata.json`, and embedded in `build-metrics.json`.
 - CNB lifecycle parity output is written to artifact root under `cnb/lifecycle-contract.json` and `cnb/lifecycle-metadata.json`.
 - Provenance output is written as `provenance.intoto.jsonl` when signing provenance is enabled.

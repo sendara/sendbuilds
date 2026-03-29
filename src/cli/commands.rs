@@ -56,6 +56,12 @@ enum Cmd {
         docker: bool,
         #[arg(long)]
         image: Option<String>,
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long = "target", value_delimiter = ',')]
+        targets: Vec<String>,
     },
     Deploy {
         repo: Option<String>,
@@ -219,12 +225,27 @@ pub fn run() -> Result<()> {
             branch,
             docker,
             image,
+            push,
+            backend,
+            targets,
         } => {
             if git.is_some() || docker {
-                return run_quick_build(git, branch, docker, image, in_place, events, reproducible);
+                return run_quick_build(
+                    git,
+                    branch,
+                    docker,
+                    image,
+                    in_place,
+                    events,
+                    reproducible,
+                    push,
+                    backend,
+                    targets,
+                );
             }
             if BuildConfig::exists(&config) {
-                let cfg = BuildConfig::from_file(&config)?;
+                let mut cfg = BuildConfig::from_file(&config)?;
+                apply_build_cli_overrides(&mut cfg, docker, image, push, backend, targets);
                 let mut build_mode = None;
                 if all {
                     build_mode = Some("all".to_string());
@@ -259,6 +280,8 @@ pub fn run() -> Result<()> {
                     config
                 );
                 let cfg = BuildConfig::for_local_workspace()?;
+                let mut cfg = cfg;
+                apply_build_cli_overrides(&mut cfg, docker, image, push, backend, targets);
                 BuildEngine::from_config(cfg)
                     .with_in_place(true)
                     .with_events(events)
@@ -415,6 +438,9 @@ fn run_deploy(
     let mut should_use_container = docker || target_requires_container || auto_container_for_deploy;
 
     if should_use_container && !docker_available {
+        if docker || target_requires_container {
+            bail!("container target requested but docker is not available");
+        }
         println!("Docker not detected. Falling back to local deploy runtime.");
         normalized_targets.retain(|t| t != "container_image");
         should_use_container = false;
@@ -533,6 +559,8 @@ fn run_deploy(
         Some(false),
         Some(normalized_targets),
         false,
+        false,
+        None,
     )
     .with_context(|| {
         format!(
@@ -1519,6 +1547,9 @@ fn deploy_artifact_root_for_source(
             container_image: None,
             container_platforms: None,
             push_container: Some(false),
+            container_backend: None,
+            verify_container_push: Some(false),
+            fail_if_container_unavailable: Some(false),
             rebase_base: None,
             kubernetes: None,
             gc: None,
@@ -1899,6 +1930,9 @@ fn run_quick_build(
     in_place: bool,
     events: Option<bool>,
     reproducible: bool,
+    push: bool,
+    backend: Option<String>,
+    targets: Vec<String>,
 ) -> Result<()> {
     run_quick_build_with_options(
         git_repo,
@@ -1909,8 +1943,14 @@ fn run_quick_build(
         events,
         None,
         None,
-        None,
+        if targets.is_empty() {
+            None
+        } else {
+            Some(targets)
+        },
         reproducible,
+        push,
+        backend,
     )
 }
 
@@ -1925,6 +1965,8 @@ fn run_quick_build_with_options(
     fail_on_scanner_unavailable: Option<bool>,
     explicit_targets: Option<Vec<String>>,
     reproducible: bool,
+    push_container: bool,
+    container_backend: Option<String>,
 ) -> Result<()> {
     let has_git = git_repo.is_some();
     let name = git_repo
@@ -1932,10 +1974,14 @@ fn run_quick_build_with_options(
         .map(project_name_from_repo)
         .unwrap_or_else(|| local_project_name());
     let mut targets = explicit_targets.unwrap_or_else(|| vec!["directory".to_string()]);
-    if docker && !targets.iter().any(|t| t == "container_image") {
+    let wants_container = docker
+        || image.is_some()
+        || push_container
+        || container_backend.is_some()
+        || targets.iter().any(|t| t == "container_image");
+    if wants_container && !targets.iter().any(|t| t == "container_image") {
         targets.push("container_image".to_string());
     }
-    let wants_container = targets.iter().any(|t| t == "container_image");
     let image_tag = image.unwrap_or_else(|| format!("{name}:latest"));
 
     let cfg = BuildConfig {
@@ -1960,8 +2006,10 @@ fn run_quick_build_with_options(
                 None
             },
             container_platforms: None,
-            // quick builds ofc
-            push_container: Some(false),
+            push_container: Some(push_container),
+            container_backend,
+            verify_container_push: Some(push_container),
+            fail_if_container_unavailable: Some(wants_container),
             rebase_base,
             kubernetes: None,
             gc: None,
@@ -2055,6 +2103,51 @@ fn normalize_target(raw: &str) -> String {
         "zip" | "serverless" => "serverless_zip".to_string(),
         "dir" => "directory".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn apply_build_cli_overrides(
+    cfg: &mut BuildConfig,
+    docker: bool,
+    image: Option<String>,
+    push: bool,
+    backend: Option<String>,
+    targets: Vec<String>,
+) {
+    let mut normalized_targets = if targets.is_empty() {
+        cfg.deploy
+            .targets
+            .clone()
+            .unwrap_or_else(|| vec!["directory".to_string()])
+    } else {
+        targets
+            .iter()
+            .map(|t| normalize_target(t))
+            .collect::<Vec<_>>()
+    };
+    let wants_container = docker
+        || image.is_some()
+        || push
+        || backend.is_some()
+        || normalized_targets.iter().any(|t| t == "container_image");
+    if wants_container && !normalized_targets.iter().any(|t| t == "container_image") {
+        normalized_targets.push("container_image".to_string());
+    }
+    if wants_container {
+        cfg.deploy.targets = Some(normalized_targets);
+        if let Some(tag) = image {
+            cfg.deploy.container_image = Some(tag);
+        }
+        if push {
+            cfg.deploy.push_container = Some(true);
+            cfg.deploy.verify_container_push = Some(true);
+        }
+        if let Some(selected_backend) = backend {
+            cfg.deploy.container_backend = Some(selected_backend);
+        }
+        cfg.deploy.fail_if_container_unavailable = Some(true);
+    } else if !targets.is_empty() {
+        cfg.deploy.targets = Some(normalized_targets);
     }
 }
 
@@ -2510,6 +2603,8 @@ fn run_rebase(
             Some(false),
             None,
             false,
+            false,
+            None,
         );
     }
 
