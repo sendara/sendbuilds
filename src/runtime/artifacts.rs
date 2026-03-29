@@ -761,9 +761,44 @@ fn send_registry_manifest_request(
         request = request.header(AUTHORIZATION, format!("Bearer {token}"));
     }
 
-    request
-        .send()
-        .with_context(|| format!("failed to request registry manifest for `{image}`"))
+    request.send().map_err(|err| {
+        anyhow::anyhow!(build_registry_manifest_request_error(
+            manifest_url,
+            image,
+            bearer_token.is_some(),
+            err.is_connect(),
+            &err.to_string(),
+        ))
+    })
+}
+
+fn build_registry_manifest_request_error(
+    manifest_url: &str,
+    image: &str,
+    authenticated: bool,
+    is_connect_error: bool,
+    err: &str,
+) -> String {
+    let stage = if authenticated {
+        "authenticated registry manifest request"
+    } else {
+        "registry manifest request"
+    };
+    let base = format!("failed to send {stage} for `{image}` at `{manifest_url}`: {err}");
+    if is_connect_error && is_local_registry_url(manifest_url) {
+        return format!(
+            "{base}. The target registry looks local to this machine, but nothing accepted the connection. \
+Make sure the local registry/service is running and reachable from the `sendbuilds` process, or disable image verification/push for this run. \
+If this is configured in `sendbuild.toml`, check `[deploy].push_container_image`, `[deploy].verify_container_image`, and `[deploy].verify_container_push`."
+        );
+    }
+    base
+}
+
+fn is_local_registry_url(manifest_url: &str) -> bool {
+    manifest_url.contains("://localhost")
+        || manifest_url.contains("://127.0.0.1")
+        || manifest_url.contains("://[::1]")
 }
 
 fn ensure_registry_manifest_success(
@@ -2068,10 +2103,10 @@ fn should_skip_workspace_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        manifest_accept_header, parse_container_backend, parse_image_reference,
-        parse_registry_error_payload, ContainerBackend,
+        build_registry_manifest_request_error, is_local_registry_url, manifest_accept_header,
+        parse_container_backend, parse_image_reference, parse_registry_error_payload,
+        ContainerBackend,
     };
-
     #[test]
     fn parses_default_docker_hub_reference() {
         let parsed = parse_image_reference("sendara/app:latest").expect("image should parse");
@@ -2142,5 +2177,32 @@ mod tests {
             parse_container_backend("buildkit").expect("backend"),
             ContainerBackend::Buildkit
         ));
+    }
+
+    #[test]
+    fn detects_local_registry_urls() {
+        assert!(is_local_registry_url(
+            "http://localhost:30500/v2/runtime/app/manifests/latest"
+        ));
+        assert!(is_local_registry_url(
+            "http://127.0.0.1:5000/v2/runtime/app/manifests/latest"
+        ));
+        assert!(!is_local_registry_url(
+            "https://registry.example.com/v2/runtime/app/manifests/latest"
+        ));
+    }
+
+    #[test]
+    fn local_registry_connect_errors_include_actionable_guidance() {
+        let message = build_registry_manifest_request_error(
+            "http://localhost:30500/v2/runtime/app/manifests/latest",
+            "localhost:30500/runtime/app:latest",
+            false,
+            true,
+            "tcp connect error: Connection refused (os error 111)",
+        );
+        assert!(message.contains("failed to send registry manifest request"));
+        assert!(message.contains("nothing accepted the connection"));
+        assert!(message.contains("[deploy].verify_container_image"));
     }
 }
