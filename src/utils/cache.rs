@@ -152,6 +152,15 @@ pub fn compute_file_signatures(root: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(signatures)
 }
 
+pub fn compute_file_signatures_incremental(
+    root: &Path,
+    previous: Option<&BuildState>,
+) -> Result<BTreeMap<String, u64>> {
+    let mut signatures = BTreeMap::new();
+    collect_file_signatures_incremental(root, root, &mut signatures, previous)?;
+    Ok(signatures)
+}
+
 pub fn fingerprint_from_signatures(signatures: &BTreeMap<String, u64>) -> String {
     let mut hasher = DefaultHasher::new();
     for (path, sig) in signatures {
@@ -275,6 +284,61 @@ fn collect_file_signatures(
     Ok(())
 }
 
+fn collect_file_signatures_incremental(
+    root: &Path,
+    cursor: &Path,
+    out: &mut BTreeMap<String, u64>,
+    previous: Option<&BuildState>,
+) -> Result<()> {
+    for entry in fs::read_dir(cursor).with_context(|| format!("cant read {}", cursor.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if ignored_dir(&name) {
+                continue;
+            }
+            collect_file_signatures_incremental(root, &path, out, previous)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // Skip hashing if file hasn't changed since last build
+        if let Some(prev) = previous {
+            if let Some(prev_sig) = prev.file_signatures.get(&rel) {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        let mtime = modified.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_millis() as u128;
+                        // Use mtime + size as quick check before full hash
+                        let size = metadata.len();
+                        let quick_sig = (mtime as u64).wrapping_mul(31) ^ size;
+                        if quick_sig == *prev_sig {
+                            out.insert(rel, *prev_sig);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        out.insert(rel, hash_file(&path)?);
+    }
+    Ok(())
+}
+
 fn ignored_dir(name: &str) -> bool {
     matches!(
         name,
@@ -328,7 +392,15 @@ fn sync_dir(src: &Path, dst: &Path, prune: bool, stats: &mut SyncStats) -> Resul
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let copied = fs::copy(&from, &to)?;
+            // Try hardlink first for faster copying
+            let copied = if fs::hard_link(&from, &to).is_ok() {
+                // Hardlink succeeded
+                let metadata = fs::metadata(&from)?;
+                metadata.len()
+            } else {
+                // Fall back to copy
+                fs::copy(&from, &to)?
+            };
             stats.copied_files += 1;
             stats.copied_bytes += copied;
         } else {
