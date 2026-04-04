@@ -13,7 +13,7 @@ pub struct FileSignature {
 }
 
 impl FileSignature {
-    fn new(path: &Path) -> Result<Self> {
+    pub fn new(path: &Path) -> Result<Self> {
         let metadata = fs::metadata(path)?;
         let modified = metadata
             .modified()
