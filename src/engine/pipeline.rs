@@ -15,7 +15,7 @@ use crate::output::{events, logger as log};
 use crate::runtime::{artifacts, cnb, git, metrics, scan, security, shell};
 use crate::utils::cache::{
     changed_modules, compute_dependency_fingerprint, compute_file_signatures_incremental,
-    fingerprint_from_signatures, BuildCache, BuildState,
+    fingerprint_from_signatures, BuildCache, BuildState, FileSignature,
 };
 use crate::utils::signing;
 use crate::workers::parallel::{self, ParallelStepTask};
@@ -655,11 +655,19 @@ impl BuildEngine {
 
         if let Some(c) = &cache {
             steps.push(
-                self.execute_step(&ctx, "cache-state-save", |_e, _cctx, step| {
+                self.execute_step(&ctx, "cache-state-save", |_e, cctx, step| {
+                    let file_signatures = current_signatures
+                        .iter()
+                        .filter_map(|(path, _hash)| {
+                            let full_path = cctx.work_dir.join(path);
+                            FileSignature::new(&full_path).ok().map(|sig| (path.clone(), sig))
+                        })
+                        .collect();
+
                     c.save_state(&BuildState {
                         source_fingerprint: source_fingerprint.clone(),
                         dependency_fingerprint: dependency_fingerprint.clone(),
-                        file_signatures: current_signatures.clone(),
+                        file_signatures,
                     })?;
                     step.push_log("cache state saved");
                     Ok(())
@@ -1301,47 +1309,32 @@ impl BuildEngine {
     }
 
     fn infer_parallel_build_cmds(&self, wd: &Path, build_cmd: &str) -> Vec<String> {
-        // Auto-parallelize Go builds
+        // Auto-parallelize Go builds only when the expected package directories exist.
         if build_cmd == "go build ./..." {
-            return vec![
-                "go build ./cmd/...".to_string(),
-                "go build ./internal/...".to_string(),
-                "go build ./pkg/...".to_string(),
-            ];
-        }
-
-        // Auto-parallelize Rust builds with workspaces
-        if build_cmd == "cargo build --release" && wd.join("Cargo.toml").exists() {
-            if let Ok(content) = std::fs::read_to_string(wd.join("Cargo.toml")) {
-                if content.contains("[workspace]") {
-                    return vec![
-                        "cargo build --release --bin".to_string(),
-                        "cargo build --release --lib".to_string(),
-                    ];
+            let mut parallel_cmds = Vec::new();
+            for dir in ["cmd", "internal", "pkg"] {
+                let candidate = wd.join(dir);
+                if candidate.exists() && candidate.is_dir() {
+                    parallel_cmds.push(format!("go build ./{}/...", dir));
                 }
+            }
+            if !parallel_cmds.is_empty() {
+                return parallel_cmds;
             }
         }
 
-        // Auto-parallelize TypeScript/JavaScript builds
+        // Cargo already parallelizes workspaces internally, so do not replace the default release command.
+
+        // Auto-parallelize TypeScript/JavaScript builds only for build partitions,
+        // not for lint/test steps that do not produce deployment artifacts.
         if wd.join("package.json").exists() {
             if let Some(pkg) = read_package_json(&wd.join("package.json")) {
                 if let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) {
-                    let mut parallel_cmds = Vec::new();
-
-                    // Check for common parallelizable scripts
                     if scripts.contains_key("build:types") && scripts.contains_key("build:js") {
-                        parallel_cmds.push("npm run build:types".to_string());
-                        parallel_cmds.push("npm run build:js".to_string());
-                    }
-
-                    if scripts.contains_key("lint") && scripts.contains_key("test") {
-                        // These can run in parallel with build
-                        parallel_cmds.push("npm run lint".to_string());
-                        parallel_cmds.push("npm run test".to_string());
-                    }
-
-                    if !parallel_cmds.is_empty() {
-                        return parallel_cmds;
+                        return vec![
+                            "npm run build:types".to_string(),
+                            "npm run build:js".to_string(),
+                        ];
                     }
                 }
             }
