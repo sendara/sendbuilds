@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::core::config::{effective_artifact_dir, project_storage_key};
+use crate::core::config::{default_cache_dir, effective_artifact_dir, project_storage_key};
 use crate::core::{BuildConfig, BuildContext, Step, StepStatus};
 use crate::errors::BuildError;
 use crate::languages;
@@ -26,6 +26,7 @@ pub struct BuildEngine {
     events_override: Option<bool>,
     reproducible: bool,
     unused_deps: bool,
+    skip_artifacts: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,6 +61,7 @@ impl BuildEngine {
             events_override: None,
             reproducible: false,
             unused_deps: false,
+            skip_artifacts: false,
         }
     }
 
@@ -85,6 +87,11 @@ impl BuildEngine {
 
     pub fn with_unused_deps(mut self, unused: bool) -> Self {
         self.unused_deps = unused;
+        self
+    }
+
+    pub fn with_skip_artifacts(mut self, skip: bool) -> Self {
+        self.skip_artifacts = skip;
         self
     }
 
@@ -667,7 +674,8 @@ impl BuildEngine {
             );
         }
 
-        steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
+        if !self.skip_artifacts {
+            steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
             let root = publish_result
                 .as_ref()
                 .map(|p| p.root.clone())
@@ -731,41 +739,42 @@ impl BuildEngine {
                 "source_fingerprint": report.get("source_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
                 "dependency_fingerprint": report.get("dependency_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
             });
-            let build_info_out = root.join("build-info.json");
-            fs::write(&build_info_out, serde_json::to_vec_pretty(&build_info)?)?;
-            step.push_log(format!("build info {}", build_info_out.display()));
-            Ok(())
-        })?);
+                let build_info_out = root.join("build-info.json");
+                fs::write(&build_info_out, serde_json::to_vec_pretty(&build_info)?)?;
+                step.push_log(format!("build info {}", build_info_out.display()));
+                Ok(())
+            })?);
 
-        steps.push(self.execute_step(&ctx, "cnb-lifecycle", |_e, _cctx, step| {
-            let root = publish_result
-                .as_ref()
-                .map(|p| p.root.clone())
-                .unwrap_or_else(|| ctx.artifact_dir.clone());
-            fs::create_dir_all(&root)?;
-            let contract = cnb::write_lifecycle_contract(&root)?;
-            let metadata = cnb::write_lifecycle_metadata(
-                &root,
-                &cfg.project.name,
-                ctx.started_at,
-                &steps,
-                publish_result
+            steps.push(self.execute_step(&ctx, "cnb-lifecycle", |_e, _cctx, step| {
+                let root = publish_result
                     .as_ref()
-                    .map(|p| p.outputs.as_slice())
-                    .unwrap_or(&[]),
-                publish_result
-                    .as_ref()
-                    .map(|p| p.warnings.as_slice())
-                    .unwrap_or(&[]),
-            )?;
-            step.push_log(format!("cnb contract {}", contract.display()));
-            step.push_log(format!("cnb metadata {}", metadata.display()));
-            if let Some(p) = &mut publish_result {
-                p.outputs.push(contract);
-                p.outputs.push(metadata);
-            }
-            Ok(())
-        })?);
+                    .map(|p| p.root.clone())
+                    .unwrap_or_else(|| ctx.artifact_dir.clone());
+                fs::create_dir_all(&root)?;
+                let contract = cnb::write_lifecycle_contract(&root)?;
+                let metadata = cnb::write_lifecycle_metadata(
+                    &root,
+                    &cfg.project.name,
+                    ctx.started_at,
+                    &steps,
+                    publish_result
+                        .as_ref()
+                        .map(|p| p.outputs.as_slice())
+                        .unwrap_or(&[]),
+                    publish_result
+                        .as_ref()
+                        .map(|p| p.warnings.as_slice())
+                        .unwrap_or(&[]),
+                )?;
+                step.push_log(format!("cnb contract {}", contract.display()));
+                step.push_log(format!("cnb metadata {}", metadata.display()));
+                if let Some(p) = &mut publish_result {
+                    p.outputs.push(contract);
+                    p.outputs.push(metadata);
+                }
+                Ok(())
+            })?);
+        }
 
         log::steps_summary(&steps);
         log_build_overview(&steps, ctx.elapsed_secs(), &cache_metrics);
@@ -899,7 +908,13 @@ impl BuildEngine {
             .as_ref()
             .and_then(|c| c.dir.as_ref())
             .map(PathBuf::from)
-            .unwrap_or_else(|| ctx.artifact_dir.join(".sendbuild-cache"));
+            .unwrap_or_else(|| {
+                if self.skip_artifacts {
+                    default_cache_dir()
+                } else {
+                    ctx.artifact_dir.join(".sendbuild-cache")
+                }
+            });
         let key = project_storage_key(&self.config);
         Ok(Some(BuildCache::new(&key, &base)?))
     }
@@ -1354,6 +1369,15 @@ impl BuildEngine {
         step: &mut Step,
         output_dir: Option<&str>,
     ) -> Result<artifacts::PublishResult> {
+        if self.skip_artifacts {
+            step.push_log("artifact generation skipped via --no-artifacts".to_string());
+            return Ok(artifacts::PublishResult {
+                root: ctx.artifact_dir.clone(),
+                outputs: Vec::new(),
+                warnings: Vec::new(),
+                container_publish: None,
+            });
+        }
         let output_src = self.output_src(ctx, output_dir);
         if !output_src.exists() {
             return Err(BuildError::MissingOutput(output_src.display().to_string()).into());

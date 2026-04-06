@@ -40,6 +40,8 @@ enum Cmd {
         in_place: bool,
         #[arg(long)]
         unused_deps: bool,
+        #[arg(long = "no-artifacts")]
+        no_artifacts: bool,
         #[arg(long)]
         workspace: bool,
         #[arg(long = "packages", value_delimiter = ',')]
@@ -221,6 +223,7 @@ pub fn run() -> Result<()> {
             reproducible,
             in_place,
             unused_deps,
+            no_artifacts,
             workspace,
             packages,
             all,
@@ -246,6 +249,7 @@ pub fn run() -> Result<()> {
                     in_place,
                     events,
                     reproducible,
+                    no_artifacts,
                     push,
                     backend,
                     targets,
@@ -262,6 +266,7 @@ pub fn run() -> Result<()> {
                     push,
                     backend,
                     targets,
+                    no_artifacts,
                 );
                 let mut build_mode = None;
                 if all {
@@ -290,6 +295,7 @@ pub fn run() -> Result<()> {
                     .with_events(events)
                     .with_reproducible(reproducible)
                     .with_unused_deps(unused_deps)
+                    .with_skip_artifacts(no_artifacts)
                     .run()
             } else {
                 println!(
@@ -307,12 +313,14 @@ pub fn run() -> Result<()> {
                     push,
                     backend,
                     targets,
+                    no_artifacts,
                 );
                 BuildEngine::from_config(cfg)
                     .with_in_place(true)
                     .with_events(events)
                     .with_reproducible(reproducible)
                     .with_unused_deps(unused_deps)
+                    .with_skip_artifacts(no_artifacts)
                     .run()
             }
         }
@@ -585,6 +593,7 @@ fn run_deploy(
         None,
         None,
         Some(false),
+        false,
         Some(normalized_targets),
         false,
         false,
@@ -1962,6 +1971,7 @@ fn run_quick_build(
     in_place: bool,
     events: Option<bool>,
     reproducible: bool,
+    no_artifacts: bool,
     push: bool,
     backend: Option<String>,
     targets: Vec<String>,
@@ -1977,6 +1987,7 @@ fn run_quick_build(
         events,
         None,
         None,
+        no_artifacts,
         if targets.is_empty() {
             None
         } else {
@@ -1999,6 +2010,7 @@ fn run_quick_build_with_options(
     events: Option<bool>,
     rebase_base: Option<String>,
     fail_on_scanner_unavailable: Option<bool>,
+    no_artifacts: bool,
     explicit_targets: Option<Vec<String>>,
     reproducible: bool,
     push_container: bool,
@@ -2104,6 +2116,7 @@ fn run_quick_build_with_options(
         .with_in_place(in_place || !has_git)
         .with_events(events)
         .with_reproducible(reproducible)
+        .with_skip_artifacts(no_artifacts)
         .run()
 }
 
@@ -2157,6 +2170,7 @@ fn apply_build_cli_overrides(
     push: bool,
     backend: Option<String>,
     targets: Vec<String>,
+    _no_artifacts: bool,
 ) {
     let mut normalized_targets = if targets.is_empty() {
         cfg.deploy
@@ -2660,6 +2674,7 @@ fn run_rebase(
             None,
             runtime_base,
             Some(false),
+            false,
             None,
             false,
             false,
@@ -2924,6 +2939,7 @@ mod tests {
             false,
             Some("docker".to_string()),
             vec!["container_image".to_string()],
+            false,
         );
 
         assert_eq!(
@@ -2955,6 +2971,7 @@ mod tests {
             false,
             None,
             vec![],
+            false,
         );
 
         assert_eq!(

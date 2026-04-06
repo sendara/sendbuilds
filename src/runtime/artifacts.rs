@@ -401,8 +401,9 @@ fn build_container_image(
                     registry_manifest_verified = true;
                     verified_image = Some(image.to_string());
                 }
-                Err(err) if should_ignore_local_post_push_manifest_verification_failure(image, &err)
-                => {
+                Err(err)
+                    if should_ignore_local_post_push_manifest_verification_failure(image, &err) =>
+                {
                     warnings.push(format!(
                         "sendbuilds pushed the image successfully; ignoring post-push manifest verification failure for local registry. image={image} error={err}"
                     ));
@@ -2263,9 +2264,11 @@ mod tests {
         let err = anyhow!(
             "failed to send registry manifest request for `registry.example.com/runtime/app:latest`: tcp connect error: Connection refused (os error 111)"
         );
-        assert!(!should_ignore_local_post_push_manifest_verification_failure(
-            "registry.example.com/runtime/app:latest",
-            &err
-        ));
+        assert!(
+            !should_ignore_local_post_push_manifest_verification_failure(
+                "registry.example.com/runtime/app:latest",
+                &err
+            )
+        );
     }
 }
