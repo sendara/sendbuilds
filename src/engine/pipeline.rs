@@ -674,8 +674,7 @@ impl BuildEngine {
             );
         }
 
-        if !self.skip_artifacts {
-            steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
+        steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
             let root = publish_result
                 .as_ref()
                 .map(|p| p.root.clone())
@@ -745,7 +744,7 @@ impl BuildEngine {
                 Ok(())
             })?);
 
-            steps.push(self.execute_step(&ctx, "cnb-lifecycle", |_e, _cctx, step| {
+        steps.push(self.execute_step(&ctx, "cnb-lifecycle", |_e, _cctx, step| {
                 let root = publish_result
                     .as_ref()
                     .map(|p| p.root.clone())
@@ -774,7 +773,6 @@ impl BuildEngine {
                 }
                 Ok(())
             })?);
-        }
 
         log::steps_summary(&steps);
         log_build_overview(&steps, ctx.elapsed_secs(), &cache_metrics);
@@ -1369,25 +1367,57 @@ impl BuildEngine {
         step: &mut Step,
         output_dir: Option<&str>,
     ) -> Result<artifacts::PublishResult> {
-        if self.skip_artifacts {
-            step.push_log("artifact generation skipped via --no-artifacts".to_string());
-            return Ok(artifacts::PublishResult {
-                root: ctx.artifact_dir.clone(),
-                outputs: Vec::new(),
-                warnings: Vec::new(),
-                container_publish: None,
-            });
-        }
-        let output_src = self.output_src(ctx, output_dir);
-        if !output_src.exists() {
-            return Err(BuildError::MissingOutput(output_src.display().to_string()).into());
-        }
         let targets = self
             .config
             .deploy
             .targets
             .clone()
             .unwrap_or_else(|| vec!["directory".to_string()]);
+        let filtered_targets = if self.skip_artifacts {
+            let filtered = targets
+                .iter()
+                .filter(|t| {
+                    !matches!(
+                        t.as_str(),
+                        "directory"
+                            | "static"
+                            | "static_site"
+                            | "tarball"
+                            | "zip"
+                            | "serverless"
+                            | "serverless_zip"
+                            | "serverless_function"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if filtered.len() != targets.len() {
+                step.push_log(
+                    "file-based artifact generation skipped via --no-artifacts; container targets still run"
+                        .to_string(),
+                );
+            }
+            filtered
+        } else {
+            targets.clone()
+        };
+        let output_src = self.output_src(ctx, output_dir);
+        if filtered_targets.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "directory"
+                    | "static"
+                    | "static_site"
+                    | "tarball"
+                    | "zip"
+                    | "serverless"
+                    | "serverless_zip"
+                    | "serverless_function"
+            )
+        }) && !output_src.exists()
+        {
+            return Err(BuildError::MissingOutput(output_src.display().to_string()).into());
+        }
         let registry_cache_ref = self
             .config
             .cache
@@ -1424,11 +1454,15 @@ impl BuildEngine {
             rebase_base: self.config.deploy.rebase_base.clone(),
         };
         let published = artifacts::publish(
-            &output_src,
+            if output_src.exists() {
+                &output_src
+            } else {
+                &ctx.work_dir
+            },
             &ctx.work_dir,
             &ctx.artifact_dir,
             &self.config.project.name,
-            &targets,
+            &filtered_targets,
             self.config.deploy.container_image.as_deref(),
             Some(&container_options),
             self.config.deploy.kubernetes.as_ref(),
