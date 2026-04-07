@@ -167,6 +167,15 @@ pub fn publish(
     })
 }
 
+pub fn publish_container_image(
+    container_src: &Path,
+    container_image: Option<&str>,
+    container_options: Option<&ContainerPublishOptions>,
+) -> Result<ContainerPublishSummary> {
+    let image = container_image.unwrap_or("sendbuild:latest");
+    build_container_image(container_src, image, container_options)
+}
+
 fn create_unique_build_root(base_dir: &Path) -> Result<PathBuf> {
     for attempt in 0..1000u32 {
         let stamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();

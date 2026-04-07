@@ -1389,6 +1389,9 @@ impl BuildEngine {
                             | "serverless"
                             | "serverless_zip"
                             | "serverless_function"
+                            | "kubernetes"
+                            | "k8s"
+                            | "kubernetes_deployment"
                     )
                 })
                 .cloned()
@@ -1427,6 +1430,9 @@ impl BuildEngine {
                     | "serverless"
                     | "serverless_zip"
                     | "serverless_function"
+                    | "kubernetes"
+                    | "k8s"
+                    | "kubernetes_deployment"
             )
         }) && !output_src.exists()
         {
@@ -1467,20 +1473,46 @@ impl BuildEngine {
             registry_cache_ref,
             rebase_base: self.config.deploy.rebase_base.clone(),
         };
-        let published = artifacts::publish(
-            if output_src.exists() {
-                &output_src
+        let published = if self.skip_artifacts {
+            let container_targets = filtered_targets
+                .iter()
+                .any(|t| t == "container_image" || t == "container");
+            if container_targets {
+                let summary = artifacts::publish_container_image(
+                    &ctx.work_dir,
+                    self.config.deploy.container_image.as_deref(),
+                    Some(&container_options),
+                )?;
+                artifacts::PublishResult {
+                    root: ctx.artifact_dir.clone(),
+                    outputs: Vec::new(),
+                    warnings: summary.warnings.clone(),
+                    container_publish: Some(summary),
+                }
             } else {
-                &ctx.work_dir
-            },
-            &ctx.work_dir,
-            &ctx.artifact_dir,
-            &self.config.project.name,
-            &filtered_targets,
-            self.config.deploy.container_image.as_deref(),
-            Some(&container_options),
-            self.config.deploy.kubernetes.as_ref(),
-        )?;
+                artifacts::PublishResult {
+                    root: ctx.artifact_dir.clone(),
+                    outputs: Vec::new(),
+                    warnings: Vec::new(),
+                    container_publish: None,
+                }
+            }
+        } else {
+            artifacts::publish(
+                if output_src.exists() {
+                    &output_src
+                } else {
+                    &ctx.work_dir
+                },
+                &ctx.work_dir,
+                &ctx.artifact_dir,
+                &self.config.project.name,
+                &filtered_targets,
+                self.config.deploy.container_image.as_deref(),
+                Some(&container_options),
+                self.config.deploy.kubernetes.as_ref(),
+            )?
+        };
         step.push_log(format!("artifact root {}", published.root.display()));
         for w in &published.warnings {
             step.push_log(format!("warning {w}"));
