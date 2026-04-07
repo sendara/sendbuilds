@@ -674,105 +674,107 @@ impl BuildEngine {
             );
         }
 
-        steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
-            let root = publish_result
-                .as_ref()
-                .map(|p| p.root.clone())
-                .unwrap_or_else(|| ctx.artifact_dir.clone());
-            let build_id = root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let source_identity = detect_source_identity(cfg, &ctx.work_dir);
-            let metrics_steps = steps
-                .iter()
-                .map(|s| StepMetric {
-                    name: s.name.clone(),
-                    status: s.status.as_str().to_string(),
-                    duration_ms: (s.duration_secs.unwrap_or_default() * 1000.0).round() as u64,
-                    cpu_percent: s.resources.map(|r| r.cpu_percent),
-                    memory_mb: s.resources.map(|r| r.memory_mb),
-                    disk_mb: s.resources.map(|r| r.disk_mb),
-                })
-                .collect::<Vec<_>>();
-            let report = serde_json::json!({
-                "project": cfg.project.name,
-                "build_id": build_id,
-                "finished_at": chrono::Local::now().to_rfc3339(),
-                "source": source_identity,
-                "cache": cache_metrics,
-                "source_fingerprint": if source_fingerprint.is_empty() { None } else { Some(source_fingerprint.clone()) },
-                "dependency_fingerprint": if dependency_fingerprint.is_empty() { None } else { Some(dependency_fingerprint.clone()) },
-                "container_publish": publish_result.as_ref().and_then(|p| p.container_publish.clone()),
-                "security": &security_report,
-                "supply_chain_metadata": &supply_chain_metadata,
-                "steps": metrics_steps
-            });
-            fs::create_dir_all(&root)?;
-            if let Some(sbom) = &security_sbom {
-                let sbom_out = root.join("sbom.json");
-                fs::write(&sbom_out, serde_json::to_vec_pretty(sbom)?)?;
-                step.push_log(format!("sbom {}", sbom_out.display()));
-            }
-            if let Some(supply) = &supply_chain_metadata {
-                let supply_out = root.join("supply-chain-metadata.json");
-                fs::write(&supply_out, serde_json::to_vec_pretty(supply)?)?;
-                step.push_log(format!("supply chain metadata {}", supply_out.display()));
-            }
-            if let Some(sec_report) = &security_report {
-                let security_out = root.join("security-report.json");
-                fs::write(&security_out, serde_json::to_vec_pretty(sec_report)?)?;
-                step.push_log(format!("security report {}", security_out.display()));
-            }
-            let out = root.join("build-metrics.json");
-            fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
-            step.push_log(format!("metrics {}", out.display()));
-
-            let build_info = serde_json::json!({
-                "schema_version": "1",
-                "project": cfg.project.name,
-                "build_id": report.get("build_id").cloned().unwrap_or(serde_json::Value::Null),
-                "finished_at": report.get("finished_at").cloned().unwrap_or(serde_json::Value::Null),
-                "source": report.get("source").cloned().unwrap_or(serde_json::Value::Null),
-                "source_fingerprint": report.get("source_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
-                "dependency_fingerprint": report.get("dependency_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
-            });
-                let build_info_out = root.join("build-info.json");
-                fs::write(&build_info_out, serde_json::to_vec_pretty(&build_info)?)?;
-                step.push_log(format!("build info {}", build_info_out.display()));
-                Ok(())
-            })?);
-
-        steps.push(self.execute_step(&ctx, "cnb-lifecycle", |_e, _cctx, step| {
+        if !self.skip_artifacts {
+            steps.push(self.execute_step(&ctx, "build-metrics", |_e, _cctx, step| {
                 let root = publish_result
                     .as_ref()
                     .map(|p| p.root.clone())
                     .unwrap_or_else(|| ctx.artifact_dir.clone());
+                let build_id = root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let source_identity = detect_source_identity(cfg, &ctx.work_dir);
+                let metrics_steps = steps
+                    .iter()
+                    .map(|s| StepMetric {
+                        name: s.name.clone(),
+                        status: s.status.as_str().to_string(),
+                        duration_ms: (s.duration_secs.unwrap_or_default() * 1000.0).round() as u64,
+                        cpu_percent: s.resources.map(|r| r.cpu_percent),
+                        memory_mb: s.resources.map(|r| r.memory_mb),
+                        disk_mb: s.resources.map(|r| r.disk_mb),
+                    })
+                    .collect::<Vec<_>>();
+                let report = serde_json::json!({
+                    "project": cfg.project.name,
+                    "build_id": build_id,
+                    "finished_at": chrono::Local::now().to_rfc3339(),
+                    "source": source_identity,
+                    "cache": cache_metrics,
+                    "source_fingerprint": if source_fingerprint.is_empty() { None } else { Some(source_fingerprint.clone()) },
+                    "dependency_fingerprint": if dependency_fingerprint.is_empty() { None } else { Some(dependency_fingerprint.clone()) },
+                    "container_publish": publish_result.as_ref().and_then(|p| p.container_publish.clone()),
+                    "security": &security_report,
+                    "supply_chain_metadata": &supply_chain_metadata,
+                    "steps": metrics_steps
+                });
                 fs::create_dir_all(&root)?;
-                let contract = cnb::write_lifecycle_contract(&root)?;
-                let metadata = cnb::write_lifecycle_metadata(
-                    &root,
-                    &cfg.project.name,
-                    ctx.started_at,
-                    &steps,
-                    publish_result
-                        .as_ref()
-                        .map(|p| p.outputs.as_slice())
-                        .unwrap_or(&[]),
-                    publish_result
-                        .as_ref()
-                        .map(|p| p.warnings.as_slice())
-                        .unwrap_or(&[]),
-                )?;
-                step.push_log(format!("cnb contract {}", contract.display()));
-                step.push_log(format!("cnb metadata {}", metadata.display()));
-                if let Some(p) = &mut publish_result {
-                    p.outputs.push(contract);
-                    p.outputs.push(metadata);
+                if let Some(sbom) = &security_sbom {
+                    let sbom_out = root.join("sbom.json");
+                    fs::write(&sbom_out, serde_json::to_vec_pretty(sbom)?)?;
+                    step.push_log(format!("sbom {}", sbom_out.display()));
                 }
-                Ok(())
-            })?);
+                if let Some(supply) = &supply_chain_metadata {
+                    let supply_out = root.join("supply-chain-metadata.json");
+                    fs::write(&supply_out, serde_json::to_vec_pretty(supply)?)?;
+                    step.push_log(format!("supply chain metadata {}", supply_out.display()));
+                }
+                if let Some(sec_report) = &security_report {
+                    let security_out = root.join("security-report.json");
+                    fs::write(&security_out, serde_json::to_vec_pretty(sec_report)?)?;
+                    step.push_log(format!("security report {}", security_out.display()));
+                }
+                let out = root.join("build-metrics.json");
+                fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
+                step.push_log(format!("metrics {}", out.display()));
+
+                let build_info = serde_json::json!({
+                    "schema_version": "1",
+                    "project": cfg.project.name,
+                    "build_id": report.get("build_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "finished_at": report.get("finished_at").cloned().unwrap_or(serde_json::Value::Null),
+                    "source": report.get("source").cloned().unwrap_or(serde_json::Value::Null),
+                    "source_fingerprint": report.get("source_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
+                    "dependency_fingerprint": report.get("dependency_fingerprint").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                    let build_info_out = root.join("build-info.json");
+                    fs::write(&build_info_out, serde_json::to_vec_pretty(&build_info)?)?;
+                    step.push_log(format!("build info {}", build_info_out.display()));
+                    Ok(())
+                })?);
+
+            steps.push(self.execute_step(&ctx, "cnb-lifecycle", |_e, _cctx, step| {
+                    let root = publish_result
+                        .as_ref()
+                        .map(|p| p.root.clone())
+                        .unwrap_or_else(|| ctx.artifact_dir.clone());
+                    fs::create_dir_all(&root)?;
+                    let contract = cnb::write_lifecycle_contract(&root)?;
+                    let metadata = cnb::write_lifecycle_metadata(
+                        &root,
+                        &cfg.project.name,
+                        ctx.started_at,
+                        &steps,
+                        publish_result
+                            .as_ref()
+                            .map(|p| p.outputs.as_slice())
+                            .unwrap_or(&[]),
+                        publish_result
+                            .as_ref()
+                            .map(|p| p.warnings.as_slice())
+                            .unwrap_or(&[]),
+                    )?;
+                    step.push_log(format!("cnb contract {}", contract.display()));
+                    step.push_log(format!("cnb metadata {}", metadata.display()));
+                    if let Some(p) = &mut publish_result {
+                        p.outputs.push(contract);
+                        p.outputs.push(metadata);
+                    }
+                    Ok(())
+                })?);
+        }
 
         log::steps_summary(&steps);
         log_build_overview(&steps, ctx.elapsed_secs(), &cache_metrics);
@@ -1393,7 +1395,7 @@ impl BuildEngine {
                 .collect::<Vec<_>>();
             if filtered.len() != targets.len() {
                 step.push_log(
-                    "file-based artifact generation skipped via --no-artifacts; container targets still run"
+                    "file-based artifacts and metadata skipped via --no-artifacts; container targets still run"
                         .to_string(),
                 );
             }
@@ -1401,6 +1403,18 @@ impl BuildEngine {
         } else {
             targets.clone()
         };
+        if self.skip_artifacts && filtered_targets.is_empty() {
+            step.push_log(
+                "file-based artifacts and metadata skipped via --no-artifacts; no publish targets remain"
+                    .to_string(),
+            );
+            return Ok(artifacts::PublishResult {
+                root: ctx.artifact_dir.clone(),
+                outputs: Vec::new(),
+                warnings: Vec::new(),
+                container_publish: None,
+            });
+        }
         let output_src = self.output_src(ctx, output_dir);
         if filtered_targets.iter().any(|t| {
             matches!(
