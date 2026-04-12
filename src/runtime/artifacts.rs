@@ -767,12 +767,34 @@ fn build_with_buildkit(
 
 fn verify_registry_manifest(image: &str) -> Result<()> {
     let reference = parse_image_reference(image)?;
-    let manifest_url = format!(
-        "{}://{}/v2/{}/manifests/{}",
-        reference.scheme, reference.registry, reference.repository, reference.reference
-    );
     let client = Client::builder().build()?;
-    let mut response = send_registry_manifest_request(&client, &manifest_url, None, image)?;
+    let mut last_transport_error = None;
+
+    for scheme in registry_manifest_schemes(&reference) {
+        let manifest_url = registry_manifest_url(&reference, scheme);
+        match verify_registry_manifest_with_url(&client, &reference.repository, image, &manifest_url)
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if scheme == "https" && should_retry_registry_manifest_over_http(&err) => {
+                last_transport_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_transport_error.unwrap_or_else(|| {
+        anyhow::anyhow!("failed to verify registry manifest for `{image}`")
+    }))
+}
+
+fn verify_registry_manifest_with_url(
+    client: &Client,
+    repository: &str,
+    image: &str,
+    manifest_url: &str,
+) -> Result<()> {
+    let mut response = send_registry_manifest_request(client, manifest_url, None, image)?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let challenge = response
@@ -781,11 +803,11 @@ fn verify_registry_manifest(image: &str) -> Result<()> {
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| anyhow::anyhow!("registry auth challenge missing for {image}"))?
             .to_string();
-        let token = fetch_registry_bearer_token(&client, &challenge, &reference.repository)?;
-        response = send_registry_manifest_request(&client, &manifest_url, Some(&token), image)?;
+        let token = fetch_registry_bearer_token(client, &challenge, repository)?;
+        response = send_registry_manifest_request(client, manifest_url, Some(&token), image)?;
     }
 
-    ensure_registry_manifest_success(response, image, &manifest_url)?;
+    ensure_registry_manifest_success(response, image, manifest_url)?;
     Ok(())
 }
 
@@ -834,6 +856,34 @@ If this is configured in `sendbuild.toml`, check `[deploy].push_container_image`
         );
     }
     base
+}
+
+fn should_retry_registry_manifest_over_http(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("failed to send registry manifest request")
+        && (text.contains("tls")
+            || text.contains("certificate")
+            || text.contains("ssl")
+            || text.contains("handshake")
+            || text.contains("unexpected eof")
+            || text.contains("connection refused")
+            || text.contains("client error (connect)")
+            || text.contains("tcp connect error"))
+}
+
+fn registry_manifest_schemes(reference: &ParsedImageReference) -> Vec<&'static str> {
+    if reference.scheme == "http" {
+        vec!["http"]
+    } else {
+        vec!["https", "http"]
+    }
+}
+
+fn registry_manifest_url(reference: &ParsedImageReference, scheme: &str) -> String {
+    format!(
+        "{scheme}://{}/v2/{}/manifests/{}",
+        reference.registry, reference.repository, reference.reference
+    )
 }
 
 fn is_local_registry_url(manifest_url: &str) -> bool {
@@ -2155,7 +2205,8 @@ mod tests {
     use super::{
         build_registry_manifest_request_error, is_local_registry_url, manifest_accept_header,
         parse_container_backend, parse_image_reference, parse_registry_error_payload,
-        should_ignore_local_post_push_manifest_verification_failure, ContainerBackend,
+        registry_manifest_schemes, should_ignore_local_post_push_manifest_verification_failure,
+        should_retry_registry_manifest_over_http, ContainerBackend,
     };
     use anyhow::anyhow;
     #[test]
@@ -2183,6 +2234,20 @@ mod tests {
         assert_eq!(parsed.repository, "sendara/app");
         assert_eq!(parsed.reference, "test");
         assert_eq!(parsed.scheme, "http");
+    }
+
+    #[test]
+    fn prefers_https_then_http_for_remote_registries() {
+        let parsed = parse_image_reference("registry.example.com/sendara/app:test")
+            .expect("image should parse");
+        assert_eq!(registry_manifest_schemes(&parsed), vec!["https", "http"]);
+    }
+
+    #[test]
+    fn keeps_http_only_for_local_registries() {
+        let parsed =
+            parse_image_reference("localhost:5000/sendara/app:test").expect("image should parse");
+        assert_eq!(registry_manifest_schemes(&parsed), vec!["http"]);
     }
 
     #[test]
@@ -2255,6 +2320,22 @@ mod tests {
         assert!(message.contains("failed to send registry manifest request"));
         assert!(message.contains("nothing accepted the connection"));
         assert!(message.contains("[deploy].verify_container_image"));
+    }
+
+    #[test]
+    fn https_transport_failures_can_retry_over_http() {
+        let err = anyhow!(
+            "failed to send registry manifest request for `registry.example.com/runtime/app:latest` at `https://registry.example.com/v2/runtime/app/manifests/latest`: error sending request for url (https://registry.example.com/v2/runtime/app/manifests/latest): error trying to connect: tls handshake failure"
+        );
+        assert!(should_retry_registry_manifest_over_http(&err));
+    }
+
+    #[test]
+    fn non_transport_failures_do_not_retry_over_http() {
+        let err = anyhow!(
+            "registry manifest verification failed for `registry.example.com/runtime/app:latest` at `https://registry.example.com/v2/runtime/app/manifests/latest` with status 401 Unauthorized"
+        );
+        assert!(!should_retry_registry_manifest_over_http(&err));
     }
 
     #[test]
