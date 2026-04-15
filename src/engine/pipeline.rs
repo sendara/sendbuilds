@@ -14,8 +14,8 @@ use crate::languages;
 use crate::output::{events, logger as log};
 use crate::runtime::{artifacts, cnb, git, metrics, scan, security, shell};
 use crate::utils::cache::{
-    changed_modules, compute_dependency_fingerprint, compute_file_signatures,
-    fingerprint_from_signatures, BuildCache, BuildState,
+    changed_modules, compute_dependency_fingerprint, compute_file_signatures_incremental,
+    fingerprint_from_signatures, BuildCache, BuildState, FileSignature,
 };
 use crate::utils::signing;
 use crate::workers::parallel::{self, ParallelStepTask};
@@ -214,7 +214,7 @@ impl BuildEngine {
             steps.push(
                 self.execute_step(&ctx, "incremental-prepare", |_e, cctx, step| {
                     previous_state = c.load_state()?;
-                    current_signatures = compute_file_signatures(&cctx.work_dir)?;
+                    current_signatures = compute_file_signatures_incremental(&cctx.work_dir, previous_state.as_ref())?;
                     source_fingerprint = fingerprint_from_signatures(&current_signatures);
                     dependency_fingerprint = compute_dependency_fingerprint(&cctx.work_dir)?;
                     changed = changed_modules(previous_state.as_ref(), &current_signatures);
@@ -662,11 +662,19 @@ impl BuildEngine {
 
         if let Some(c) = &cache {
             steps.push(
-                self.execute_step(&ctx, "cache-state-save", |_e, _cctx, step| {
+                self.execute_step(&ctx, "cache-state-save", |_e, cctx, step| {
+                    let file_signatures = current_signatures
+                        .iter()
+                        .filter_map(|(path, _hash)| {
+                            let full_path = cctx.work_dir.join(path);
+                            FileSignature::new(&full_path).ok().map(|sig| (path.clone(), sig))
+                        })
+                        .collect();
+
                     c.save_state(&BuildState {
                         source_fingerprint: source_fingerprint.clone(),
                         dependency_fingerprint: dependency_fingerprint.clone(),
-                        file_signatures: current_signatures.clone(),
+                        file_signatures,
                     })?;
                     step.push_log("cache state saved");
                     Ok(())
@@ -822,9 +830,15 @@ impl BuildEngine {
         let output_dir = cfg
             .and_then(|b| b.output_dir.clone())
             .or_else(|| self.infer_output_dir(&ctx.work_dir));
-        let parallel_build_cmds = cfg
+        let mut parallel_build_cmds = cfg
             .and_then(|b| b.parallel_build_cmds.clone())
             .unwrap_or_default();
+
+        // Auto-detect parallel build opportunities
+        if parallel_build_cmds.is_empty() {
+            parallel_build_cmds = self.infer_parallel_build_cmds(&ctx.work_dir, &build_cmd);
+        }
+
         step.push_log(format!(
             "install_cmd={}",
             shell::redact_command_for_log(&install_cmd)
@@ -833,6 +847,12 @@ impl BuildEngine {
             "build_cmd={}",
             shell::redact_command_for_log(&build_cmd)
         ));
+        if !parallel_build_cmds.is_empty() {
+            step.push_log(format!(
+                "parallel_build_cmds={}",
+                parallel_build_cmds.iter().map(|cmd| shell::redact_command_for_log(cmd)).collect::<Vec<_>>().join(", ")
+            ));
+        }
         step.push_log(format!(
             "output_dir={}",
             output_dir
@@ -1301,6 +1321,41 @@ impl BuildEngine {
             return Some("dist".to_string());
         }
         None
+    }
+
+    fn infer_parallel_build_cmds(&self, wd: &Path, build_cmd: &str) -> Vec<String> {
+        // Auto-parallelize Go builds only when the expected package directories exist.
+        if build_cmd == "go build ./..." {
+            let mut parallel_cmds = Vec::new();
+            for dir in ["cmd", "internal", "pkg"] {
+                let candidate = wd.join(dir);
+                if candidate.exists() && candidate.is_dir() {
+                    parallel_cmds.push(format!("go build ./{}/...", dir));
+                }
+            }
+            if !parallel_cmds.is_empty() {
+                return parallel_cmds;
+            }
+        }
+
+        // Cargo already parallelizes workspaces internally, so do not replace the default release command.
+
+        // Auto-parallelize TypeScript/JavaScript builds only for build partitions,
+        // not for lint/test steps that do not produce deployment artifacts.
+        if wd.join("package.json").exists() {
+            if let Some(pkg) = read_package_json(&wd.join("package.json")) {
+                if let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) {
+                    if scripts.contains_key("build:types") && scripts.contains_key("build:js") {
+                        return vec![
+                            "npm run build:types".to_string(),
+                            "npm run build:js".to_string(),
+                        ];
+                    }
+                }
+            }
+        }
+
+        Vec::new()
     }
 
     fn execute_step<F>(&self, ctx: &BuildContext, name: &str, run: F) -> Result<Step>

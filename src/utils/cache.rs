@@ -7,10 +7,32 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
+pub struct FileSignature {
+    pub hash: u64,
+    pub quick_sig: u64,
+}
+
+impl FileSignature {
+    pub fn new(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path)?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let size = metadata.len();
+        let quick_sig = modified.wrapping_mul(31) ^ size;
+        let hash = hash_file(path)?;
+        Ok(Self { hash, quick_sig })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BuildState {
     pub source_fingerprint: String,
     pub dependency_fingerprint: String,
-    pub file_signatures: BTreeMap<String, u64>,
+    pub file_signatures: BTreeMap<String, FileSignature>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,11 +94,21 @@ impl BuildCache {
                 continue;
             }
             if let Some(value) = line.strip_prefix("file\t") {
-                let mut parts = value.splitn(2, '\t');
+                let mut parts = value.split('\t');
                 let path = parts.next().unwrap_or_default();
-                let sig = parts.next().unwrap_or_default();
-                if let Ok(parsed) = sig.parse::<u64>() {
-                    file_signatures.insert(path.to_string(), parsed);
+                let hash = parts.next().unwrap_or_default();
+                let quick = parts.next();
+                if let Ok(hash) = hash.parse::<u64>() {
+                    let quick_sig = quick
+                        .and_then(|val| val.parse::<u64>().ok())
+                        .unwrap_or(hash);
+                    file_signatures.insert(
+                        path.to_string(),
+                        FileSignature {
+                            hash,
+                            quick_sig,
+                        },
+                    );
                 }
             }
         }
@@ -102,7 +134,7 @@ impl BuildCache {
             state.dependency_fingerprint
         )?;
         for (path, sig) in &state.file_signatures {
-            writeln!(file, "file\t{}\t{}", path, sig)?;
+            writeln!(file, "file\t{}\t{}\t{}", path, sig.hash, sig.quick_sig)?;
         }
         Ok(())
     }
@@ -149,6 +181,15 @@ impl BuildCache {
 pub fn compute_file_signatures(root: &Path) -> Result<BTreeMap<String, u64>> {
     let mut signatures = BTreeMap::new();
     collect_file_signatures(root, root, &mut signatures)?;
+    Ok(signatures)
+}
+
+pub fn compute_file_signatures_incremental(
+    root: &Path,
+    previous: Option<&BuildState>,
+) -> Result<BTreeMap<String, u64>> {
+    let mut signatures = BTreeMap::new();
+    collect_file_signatures_incremental(root, root, &mut signatures, previous)?;
     Ok(signatures)
 }
 
@@ -218,7 +259,12 @@ pub fn changed_modules(
     let mut changed = BTreeSet::new();
 
     for (path, sig) in current {
-        if prev.file_signatures.get(path) != Some(sig) {
+        if prev
+            .file_signatures
+            .get(path)
+            .map(|signature| signature.hash)
+            != Some(*sig)
+        {
             changed.insert(module_name(path));
         }
     }
@@ -270,7 +316,57 @@ fn collect_file_signatures(
             .to_string_lossy()
             .replace('\\', "/");
 
-        out.insert(rel, hash_file(&path)?);
+        let signature = FileSignature::new(&path)?;
+        out.insert(rel, signature.hash);
+    }
+    Ok(())
+}
+
+fn collect_file_signatures_incremental(
+    root: &Path,
+    cursor: &Path,
+    out: &mut BTreeMap<String, u64>,
+    previous: Option<&BuildState>,
+) -> Result<()> {
+    for entry in fs::read_dir(cursor).with_context(|| format!("cant read {}", cursor.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if ignored_dir(&name) {
+                continue;
+            }
+            collect_file_signatures_incremental(root, &path, out, previous)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if let Some(prev) = previous {
+            if let Some(prev_sig) = prev.file_signatures.get(&rel) {
+                let current_sig = FileSignature::new(&path)?;
+                if current_sig.quick_sig == prev_sig.quick_sig {
+                    out.insert(rel, prev_sig.hash);
+                    continue;
+                }
+                out.insert(rel, current_sig.hash);
+                continue;
+            }
+        }
+
+        let signature = FileSignature::new(&path)?;
+        out.insert(rel, signature.hash);
     }
     Ok(())
 }
@@ -328,7 +424,15 @@ fn sync_dir(src: &Path, dst: &Path, prune: bool, stats: &mut SyncStats) -> Resul
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let copied = fs::copy(&from, &to)?;
+            // Try hardlink first for faster copying
+            let copied = if fs::hard_link(&from, &to).is_ok() {
+                // Hardlink succeeded
+                let metadata = fs::metadata(&from)?;
+                metadata.len()
+            } else {
+                // Fall back to copy
+                fs::copy(&from, &to)?
+            };
             stats.copied_files += 1;
             stats.copied_bytes += copied;
         } else {
