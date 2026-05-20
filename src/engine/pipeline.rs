@@ -988,6 +988,7 @@ impl BuildEngine {
         }
         let candidates = self.install_fallback_candidates(cmd);
         let mut failures = Vec::new();
+        let mut pnpm_ignored_builds = Vec::new();
         for (i, c) in candidates.iter().enumerate() {
             step.push_log(format!(
                 "install attempt {} {}",
@@ -1001,6 +1002,9 @@ impl BuildEngine {
             if run.success {
                 return Ok(run);
             }
+            if pnpm_ignored_builds.is_empty() {
+                pnpm_ignored_builds = self.detect_pnpm_ignored_builds(&run);
+            }
             let hint = explain_exit_code(run.exit_code)
                 .map(|v| format!(" hint={v}"))
                 .unwrap_or_default();
@@ -1012,9 +1016,63 @@ impl BuildEngine {
                 hint
             ));
         }
+        if !pnpm_ignored_builds.is_empty() && cmd.trim_start().starts_with("pnpm install") {
+            // pnpm blocks build scripts until they are explicitly approved, so approve them once
+            // and then retry the original install candidates.
+            let approval_cmd = "pnpm approve-builds --all";
+            step.push_log(format!(
+                "install approval attempt 1 {}",
+                shell::redact_command_for_log(approval_cmd)
+            ));
+            let approval_run =
+                shell::run_allow_failure_with_line_handler(approval_cmd, wd, env, sandbox, |line| {
+                    step.push_log(line.to_string());
+                    log::pipe(line);
+                })?;
+            if approval_run.success {
+                step.push_log(format!(
+                    "pnpm build scripts auto-approved for: {}",
+                    pnpm_ignored_builds.join(", ")
+                ));
+                for (i, c) in candidates.iter().enumerate() {
+                    step.push_log(format!(
+                        "install approval retry {} {}",
+                        i + 1,
+                        shell::redact_command_for_log(c)
+                    ));
+                    let run = shell::run_allow_failure_with_line_handler(c, wd, env, sandbox, |line| {
+                        step.push_log(line.to_string());
+                        log::pipe(line);
+                    })?;
+                    if run.success {
+                        return Ok(run);
+                    }
+                    let hint = explain_exit_code(run.exit_code)
+                        .map(|v| format!(" hint={v}"))
+                        .unwrap_or_default();
+                    failures.push(format!(
+                        "approval retry {} cmd=`{}` exit={:?}{}",
+                        i + 1,
+                        shell::redact_command_for_log(c),
+                        run.exit_code,
+                        hint
+                    ));
+                }
+            } else {
+                let hint = explain_exit_code(approval_run.exit_code)
+                    .map(|v| format!(" hint={v}"))
+                    .unwrap_or_default();
+                failures.push(format!(
+                    "approval attempt 1 cmd=`{}` exit={:?}{}",
+                    shell::redact_command_for_log(approval_cmd),
+                    approval_run.exit_code,
+                    hint
+                ));
+            }
+        }
         bail!(
             "install failed after {} attempt(s): {}",
-            candidates.len(),
+            failures.len(),
             failures.join(" | ")
         )
     }
@@ -1032,6 +1090,53 @@ impl BuildEngine {
             push_unique(&mut out, initial.replacen("npm ci", "npm install", 1));
         }
         out
+    }
+
+    fn detect_pnpm_ignored_builds(&self, run: &shell::ShellRunOutput) -> Vec<String> {
+        let mut packages = Vec::new();
+        for line in &run.logs {
+            let lower = line.to_lowercase();
+            if !lower.contains("ignored build scripts:") && !lower.contains("build scripts were ignored")
+            {
+                continue;
+            }
+            let extracted = if let Some((_, rest)) = line.split_once("Ignored build scripts:") {
+                rest.to_string()
+            } else if let Some((_, rest)) = line.split_once(
+                "The following dependencies have build scripts that were ignored:",
+            ) {
+                rest.to_string()
+            } else {
+                continue;
+            };
+            let trimmed = extracted
+                .split_once("Run ")
+                .map(|(prefix, _)| prefix)
+                .unwrap_or(extracted.as_str())
+                .trim();
+            for item in trimmed.split(',') {
+                let pkg = item.trim().trim_matches(|c: char| {
+                    c == '.'
+                        || c == ';'
+                        || c == ':'
+                        || c == ')'
+                        || c == '('
+                        || c.is_whitespace()
+                });
+                if pkg.is_empty() {
+                    continue;
+                }
+                let pkg = pkg
+                    .rsplit_once('@')
+                    .map(|(name, _version)| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(pkg);
+                if !packages.iter().any(|existing| existing == pkg) {
+                    packages.push(pkg.to_string());
+                }
+            }
+        }
+        packages
     }
 
     fn validate_dependency_restore(&self, work_dir: &Path) -> bool {
@@ -1867,6 +1972,67 @@ impl BuildEngine {
             return Some("static".to_string());
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> BuildConfig {
+        BuildConfig {
+            project: crate::core::config::ProjectConfig {
+                name: "app".to_string(),
+                language: None,
+            },
+            workspace: None,
+            packages: None,
+            source: None,
+            build: None,
+            deploy: crate::core::config::DeployConfig {
+                artifact_dir: crate::core::config::default_artifact_dir()
+                    .display()
+                    .to_string(),
+                targets: Some(vec!["directory".to_string()]),
+                container_image: None,
+                push_container_image: None,
+                verify_container_image: None,
+                container_platforms: None,
+                push_container: Some(false),
+                container_backend: None,
+                verify_container_push: Some(false),
+                fail_if_container_unavailable: Some(false),
+                rebase_base: None,
+                kubernetes: None,
+                gc: None,
+            },
+            output: None,
+            cache: None,
+            scan: None,
+            security: None,
+            env: None,
+            env_from_host: None,
+            sandbox: None,
+            signing: None,
+            compatibility: None,
+        }
+    }
+
+    #[test]
+    fn detect_pnpm_ignored_builds_parses_scoped_and_unscoped_packages() {
+        let engine = BuildEngine::from_config(test_config());
+        let run = shell::ShellRunOutput {
+            logs: vec![
+                "stdout: [ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: sharp@0.34.5, @scope/pkg@1.2.3"
+                    .to_string(),
+                "stdout: Run \"pnpm approve-builds\" to pick which dependencies should be allowed to run scripts."
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let packages = engine.detect_pnpm_ignored_builds(&run);
+        assert_eq!(packages, vec!["sharp".to_string(), "@scope/pkg".to_string()]);
     }
 }
 
